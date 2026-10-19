@@ -34,13 +34,15 @@ permissions:
 
 jobs:
   submit-request:
+    name: Validate VM and Save Request
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Azure login using OIDC
+      # Preserve existing OIDC authentication.
+      - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -55,14 +57,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=== Azure CLI identity ==="
-          az account show --query "{subscription:id,tenant:tenantId,user:user}" --output json
+          Write-Host "Checking Azure CLI authentication..."
+
+          az account show --query "{subscription:id,tenant:tenantId}" --output json
 
           if ($LASTEXITCODE -ne 0) {
             throw "Azure CLI authentication check failed."
           }
 
-          Write-Host "=== Check Table ==="
+          Write-Host "Checking Storage Table..."
+
           az storage table exists `
             --account-name $env:STORAGE_ACCOUNT `
             --name $env:TABLE_NAME `
@@ -70,10 +74,11 @@ jobs:
             --output json
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Unable to check Storage Table. Review the Azure CLI error above."
+            throw "Storage Table existence check failed."
           }
 
-          Write-Host "=== Create Table if missing ==="
+          Write-Host "Creating table if it does not exist..."
+
           az storage table create `
             --account-name $env:STORAGE_ACCOUNT `
             --name $env:TABLE_NAME `
@@ -81,7 +86,7 @@ jobs:
             --output json
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Table creation failed. Review the Azure CLI error above."
+            throw "Storage Table creation failed."
           }
 
       - name: Validate VM and Insert Request
@@ -92,6 +97,10 @@ jobs:
           VM_NAME: ${{ inputs.vm_name }}
           VM_ENVIRONMENT: ${{ inputs.environment }}
           REQUESTER: ${{ inputs.requester }}
+
+          # FIX: Pass tenant ID into the PowerShell script.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
         run: |
