@@ -2,7 +2,7 @@
 $ErrorActionPreference = "Stop"
 
 # =========================================================
-# 1. Read GitHub Actions inputs
+# 1. Read pipeline inputs
 # =========================================================
 $subscriptionId = $env:SUBSCRIPTION_ID
 $resourceGroup  = $env:RESOURCE_GROUP
@@ -14,14 +14,18 @@ $storageAccount = $env:STORAGE_ACCOUNT
 $tableName      = $env:TABLE_NAME
 $webhookUrl     = $env:DECOMMISSION_NOTIFICATION_WEBHOOK
 
-if ([string]::IsNullOrWhiteSpace($subscriptionId) -or
-    [string]::IsNullOrWhiteSpace($resourceGroup) -or
-    [string]::IsNullOrWhiteSpace($vmName) -or
-    [string]::IsNullOrWhiteSpace($requester) -or
-    [string]::IsNullOrWhiteSpace($tenantId) -or
-    [string]::IsNullOrWhiteSpace($storageAccount) -or
-    [string]::IsNullOrWhiteSpace($tableName)) {
-    throw "One or more required pipeline inputs are missing."
+foreach ($item in @(
+    @{ Name = "SUBSCRIPTION_ID"; Value = $subscriptionId },
+    @{ Name = "RESOURCE_GROUP"; Value = $resourceGroup },
+    @{ Name = "VM_NAME"; Value = $vmName },
+    @{ Name = "REQUESTER"; Value = $requester },
+    @{ Name = "AZURE_TENANT_ID"; Value = $tenantId },
+    @{ Name = "STORAGE_ACCOUNT"; Value = $storageAccount },
+    @{ Name = "TABLE_NAME"; Value = $tableName }
+)) {
+    if ([string]::IsNullOrWhiteSpace($item.Value)) {
+        throw "Required input is missing: $($item.Name)"
+    }
 }
 
 if ($environment -notin @("Dev", "Prod")) {
@@ -33,12 +37,12 @@ if (-not [guid]::TryParse(
     $subscriptionId,
     [ref]$parsedSubscriptionId
 )) {
-    throw "Subscription ID must be a valid GUID."
+    throw "Subscription ID is not a valid GUID."
 }
 
 $waitingDays = if ($environment -eq "Dev") { 7 } else { 11 }
 
-$requestId = [guid]::NewGuid().ToString()
+$requestId  = [guid]::NewGuid().ToString()
 $requestedAt = [DateTime]::UtcNow
 $scheduledAt = $requestedAt.AddDays($waitingDays)
 
@@ -47,38 +51,56 @@ Write-Host "Environment: $environment"
 Write-Host "Scheduled eligibility date UTC: $($scheduledAt.ToString('o'))"
 
 # =========================================================
-# 2. Verify Azure PowerShell authentication and subscription
+# 2. Validate OIDC context, tenant and subscription
 # =========================================================
 $currentContext = Get-AzContext
 
 if ($null -eq $currentContext -or
     $null -eq $currentContext.Account) {
-    throw "Azure PowerShell is not authenticated. Check azure/login@v2 OIDC configuration."
+    throw "Azure PowerShell is not authenticated. Check azure/login@v2 OIDC."
 }
 
-$subscription = Get-AzSubscription `
-    -SubscriptionId $subscriptionId `
-    -TenantId $tenantId `
-    -ErrorAction Stop
+Write-Host "Authenticated account: $($currentContext.Account.Id)"
+Write-Host "Configured tenant: $tenantId"
+Write-Host "Requested subscription: $subscriptionId"
 
-if ($null -eq $subscription) {
-    throw "Subscription not found or not accessible to the OIDC identity."
+if ($currentContext.Tenant.Id -ne $tenantId) {
+    throw "Authenticated Azure tenant does not match AZURE_TENANT_ID. Check GitHub secrets."
 }
 
-Set-AzContext `
-    -SubscriptionObject $subscription `
-    -ErrorAction Stop | Out-Null
+if ($currentContext.Subscription -and
+    $currentContext.Subscription.Id -eq $subscriptionId) {
+    Write-Host "Requested subscription already selected by OIDC."
+}
+else {
+    $subscriptions = @(
+        Get-AzSubscription -TenantId $tenantId -ErrorAction Stop
+    )
+
+    $subscription = $subscriptions |
+        Where-Object { $_.Id -eq $subscriptionId } |
+        Select-Object -First 1
+
+    if ($null -eq $subscription) {
+        throw "Subscription $subscriptionId is not visible in tenant $tenantId. Verify the subscription ID and identity access."
+    }
+
+    Set-AzContext `
+        -SubscriptionObject $subscription `
+        -ErrorAction Stop | Out-Null
+}
 
 $verifiedContext = Get-AzContext
 
-if ($verifiedContext.Subscription.Id -ne $subscriptionId) {
+if ($null -eq $verifiedContext.Subscription -or
+    $verifiedContext.Subscription.Id -ne $subscriptionId) {
     throw "Azure subscription context verification failed."
 }
 
 Write-Host "Azure subscription context verified."
 
 # =========================================================
-# 3. Validate VM
+# 3. Validate target VM
 # =========================================================
 $vm = Get-AzVM `
     -ResourceGroupName $resourceGroup `
@@ -93,7 +115,7 @@ Write-Host "VM found: $($vm.Name)"
 Write-Host "VM Resource ID: $($vm.Id)"
 
 # =========================================================
-# 4. Inventory NIC, Public IP, NSG and disks
+# 4. Collect VM dependencies
 # =========================================================
 $nicIds = @(
     $vm.NetworkProfile.NetworkInterfaces |
@@ -102,7 +124,7 @@ $nicIds = @(
 )
 
 if ($nicIds.Count -eq 0) {
-    throw "No NICs found on this VM. Request requires manual review."
+    throw "No NICs are attached to this VM. Manual review is required."
 }
 
 $nicInventory = @()
@@ -160,7 +182,7 @@ Write-Host "NSG count: $($nsgIds.Count)"
 Write-Host "Data disk count: $($dataDiskIds.Count)"
 
 # =========================================================
-# 5. Build request and inventory JSON
+# 5. Prepare request summary
 # =========================================================
 $nicJson = ConvertTo-Json -InputObject @($nicInventory) -Depth 10 -Compress
 $publicIpJson = ConvertTo-Json -InputObject @($publicIpIds) -Compress
@@ -193,8 +215,8 @@ $summary |
     Set-Content -Path "decommission-request-summary.json" -Encoding utf8
 
 # =========================================================
-# 6. Create Azure Storage Table
-# Requires Azure CLI login and Table data permissions
+# 6. Create table and save request
+# Requires Azure CLI to be authenticated and authorized.
 # =========================================================
 $null = & az storage table create `
     --name $tableName `
@@ -203,14 +225,9 @@ $null = & az storage table create `
     --output none
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Unable to create or access the Azure Storage Table. Check Azure CLI login and Storage Table data permissions."
+    throw "Unable to create/access the Azure Table. Check Azure CLI authentication and Storage Table data permissions."
 }
 
-# =========================================================
-# 7. Save request in Azure Table Storage
-# PartitionKey = subscription ID
-# RowKey       = request ID
-# =========================================================
 $entityArgs = @(
     "PartitionKey=$subscriptionId"
     "RowKey=$requestId"
@@ -242,13 +259,13 @@ $null = & az storage entity insert `
     --output none
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to save request in Azure Table Storage."
+    throw "Failed to insert request into Azure Table Storage."
 }
 
-Write-Host "Request successfully saved to $storageAccount/$tableName"
+Write-Host "Request saved to $storageAccount/$tableName"
 
 # =========================================================
-# 8. Notify customer through configured HTTPS webhook
+# 7. Send notification if webhook is configured
 # =========================================================
 if (-not [string]::IsNullOrWhiteSpace($webhookUrl)) {
     if ($webhookUrl -notmatch '^https://') {
@@ -265,7 +282,7 @@ if (-not [string]::IsNullOrWhiteSpace($webhookUrl)) {
         requestedBy = $requester
         scheduledDeletionAtUtc = $scheduledAt.ToString("o")
         approvalStatus = "Pending"
-        message = "Decommission request created. No Azure resources have been deleted."
+        message = "A decommission request was created. No Azure resources have been deleted."
     } | ConvertTo-Json -Depth 5
 
     Invoke-RestMethod `
@@ -285,15 +302,14 @@ if (-not [string]::IsNullOrWhiteSpace($webhookUrl)) {
         --output none
 
     if ($LASTEXITCODE -ne 0) {
-        throw "Notification was sent, but its status could not be updated in the table."
+        throw "Notification was sent, but notification status could not be updated."
     }
 
     Write-Host "Customer notification sent."
 }
 else {
-    Write-Warning "Webhook is not configured. Request saved, but customer notification was not sent."
+    Write-Warning "Notification webhook not configured. Request saved, but notification was not sent."
 }
 
-Write-Host "Pipeline 1 completed successfully."
+Write-Host "Pipeline 1 completed. No Azure resources were deleted."
 Write-Host "Request ID: $requestId"
-Write-Host "No resources were deleted."
