@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       subscription_id:
-        description: "Azure Subscription ID"
+        description: "Azure Subscription ID containing the VM"
         required: true
         type: string
       resource_group:
