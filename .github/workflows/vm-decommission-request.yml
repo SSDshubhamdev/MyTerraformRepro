@@ -8,17 +8,14 @@ on:
         description: Azure Subscription ID
         required: true
         type: string
-
       resource_group:
         description: Resource Group Name
         required: true
         type: string
-
       vm_name:
         description: Virtual Machine Name
         required: true
         type: string
-
       environment:
         description: Environment
         required: true
@@ -26,7 +23,6 @@ on:
         options:
           - Dev
           - Prod
-
       requester:
         description: Request Raised By
         required: true
@@ -45,7 +41,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Keep existing OIDC authentication.
       - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
@@ -61,17 +56,17 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking Azure authentication..."
+          Write-Host "Checking Azure CLI login..."
 
           az account show --query "{subscription:id,tenant:tenantId}" --output json
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Azure CLI authentication check failed."
+            throw "Azure CLI login verification failed."
           }
 
           Write-Host "Checking Storage Table..."
 
-          az storage table exists `
+          $tableOutput = az storage table exists `
             --account-name $env:STORAGE_ACCOUNT `
             --name $env:TABLE_NAME `
             --auth-mode login `
@@ -81,16 +76,23 @@ jobs:
             throw "Storage Table existence check failed."
           }
 
-          Write-Host "Creating table if it does not exist..."
+          $tableResult = ($tableOutput | Out-String) | ConvertFrom-Json
 
-          az storage table create `
-            --account-name $env:STORAGE_ACCOUNT `
-            --name $env:TABLE_NAME `
-            --auth-mode login `
-            --output json
+          if (-not $tableResult.exists) {
+            Write-Host "Table does not exist. Creating it..."
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Storage Table creation failed."
+            az storage table create `
+              --account-name $env:STORAGE_ACCOUNT `
+              --name $env:TABLE_NAME `
+              --auth-mode login `
+              --output json
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Storage Table creation failed."
+            }
+          }
+          else {
+            Write-Host "Storage Table already exists."
           }
 
       - name: Validate VM and Insert Request
