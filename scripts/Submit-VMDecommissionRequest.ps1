@@ -1,31 +1,34 @@
 
 $ErrorActionPreference = "Stop"
 
-# ---------------------------------------------------------
-# 1. Read and validate workflow inputs
-# ---------------------------------------------------------
+# =========================================================
+# 1. Read and validate inputs
+# =========================================================
 
 $subscriptionId = $env:SUBSCRIPTION_ID
-$resourceGroup   = $env:RESOURCE_GROUP
-$vmName          = $env:VM_NAME
-$environment     = $env:VM_ENVIRONMENT
-$requester       = $env:REQUESTER
-$tenantId        = $env:AZURE_TENANT_ID
-$storageAccount  = $env:STORAGE_ACCOUNT
-$tableName       = $env:TABLE_NAME
+$resourceGroup  = $env:RESOURCE_GROUP
+$vmName         = $env:VM_NAME
+$environment    = $env:VM_ENVIRONMENT
+$requester      = $env:REQUESTER
+$tenantId       = $env:AZURE_TENANT_ID
+$storageAccount = $env:STORAGE_ACCOUNT
+$tableName      = $env:TABLE_NAME
+$webhook        = $env:DECOMMISSION_NOTIFICATION_WEBHOOK
 
-foreach ($item in @(
-    @{ Name = "SUBSCRIPTION_ID"; Value = $subscriptionId },
-    @{ Name = "RESOURCE_GROUP"; Value = $resourceGroup },
-    @{ Name = "VM_NAME"; Value = $vmName },
-    @{ Name = "VM_ENVIRONMENT"; Value = $environment },
-    @{ Name = "REQUESTER"; Value = $requester },
-    @{ Name = "AZURE_TENANT_ID"; Value = $tenantId },
-    @{ Name = "STORAGE_ACCOUNT"; Value = $storageAccount },
-    @{ Name = "TABLE_NAME"; Value = $tableName }
-)) {
-    if ([string]::IsNullOrWhiteSpace([string]$item.Value)) {
-        throw "Required workflow input is missing: $($item.Name)"
+$requiredInputs = @{
+    SUBSCRIPTION_ID = $subscriptionId
+    RESOURCE_GROUP  = $resourceGroup
+    VM_NAME         = $vmName
+    VM_ENVIRONMENT  = $environment
+    REQUESTER       = $requester
+    AZURE_TENANT_ID = $tenantId
+    STORAGE_ACCOUNT = $storageAccount
+    TABLE_NAME      = $tableName
+}
+
+foreach ($key in $requiredInputs.Keys) {
+    if ([string]::IsNullOrWhiteSpace([string]$requiredInputs[$key])) {
+        throw "Required input is missing: $key"
     }
 }
 
@@ -33,9 +36,9 @@ if ($environment -notin @("Dev", "Prod")) {
     throw "Environment must be Dev or Prod."
 }
 
-$parsedSubscriptionId = [guid]::Empty
-if (-not [guid]::TryParse($subscriptionId, [ref]$parsedSubscriptionId)) {
-    throw "SUBSCRIPTION_ID is not a valid GUID."
+$parsedGuid = [guid]::Empty
+if (-not [guid]::TryParse($subscriptionId, [ref]$parsedGuid)) {
+    throw "SUBSCRIPTION_ID must be a valid GUID."
 }
 
 if ($requester.Length -gt 200) {
@@ -43,18 +46,24 @@ if ($requester.Length -gt 200) {
 }
 
 $waitDays = if ($environment -eq "Prod") { 11 } else { 7 }
+
 $createdUtc = [DateTimeOffset]::UtcNow
 $eligibilityUtc = $createdUtc.AddDays($waitDays)
+$requestId = [guid]::NewGuid().ToString()
 
-Write-Host "Request ID will be generated."
+$summaryPath = Join-Path $env:GITHUB_WORKSPACE "decommission-request-summary.json"
+
+Write-Host "Request ID: $requestId"
 Write-Host "Environment: $environment"
-Write-Host "Scheduled eligibility date UTC: $($eligibilityUtc.ToString('o'))"
-Write-Host "Storage account: $storageAccount"
+Write-Host "Resource Group: $resourceGroup"
+Write-Host "VM: $vmName"
+Write-Host "Storage Account: $storageAccount"
 Write-Host "Table: $tableName"
+Write-Host "Scheduled eligibility UTC: $($eligibilityUtc.ToString('o'))"
 
-# ---------------------------------------------------------
-# 2. Helper: run Azure CLI and expose the real error
-# ---------------------------------------------------------
+# =========================================================
+# 2. Azure CLI helper with detailed error output
+# =========================================================
 
 function Invoke-AzCli {
     param(
@@ -65,48 +74,95 @@ function Invoke-AzCli {
         [string]$Operation
     )
 
-    $result = @(& az @Arguments 2>&1)
+    $output = @(& az @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
-    $outputText = ($result | ForEach-Object { "$_" }) -join "`n"
+    $outputText = ($output | ForEach-Object { "$_" }) -join "`n"
 
     if ($exitCode -ne 0) {
-        Write-Host "AZURE CLI OPERATION FAILED: $Operation"
+        Write-Host "Azure CLI operation failed: $Operation"
         Write-Host "Exit code: $exitCode"
         Write-Host "Azure CLI response:"
         Write-Host $outputText
-        throw "$Operation failed. Review the Azure CLI response above."
+
+        throw "$Operation failed. See the detailed Azure CLI response above."
     }
 
     return $outputText
 }
 
-# ---------------------------------------------------------
-# 3. Verify OIDC / Azure PowerShell subscription context
-# ---------------------------------------------------------
+# =========================================================
+# 3. Verify tenant and select the requested subscription
+# =========================================================
 
 $context = Get-AzContext
 
-if ($null -eq $context -or $null -eq $context.Subscription) {
+if ($null -eq $context -or $null -eq $context.Tenant) {
     throw "Azure PowerShell context is missing. Check Azure OIDC login."
 }
 
-Write-Host "Authenticated account: $($context.Account.Id)"
-Write-Host "Configured tenant: $($context.Tenant.Id)"
-Write-Host "Selected subscription: $($context.Subscription.Id)"
+Write-Host "Current tenant ID: $($context.Tenant.Id)"
+Write-Host "Requested tenant ID: $tenantId"
+Write-Host "Current subscription ID: $($context.Subscription.Id)"
+Write-Host "Requested subscription ID: $subscriptionId"
 
 if ($context.Tenant.Id -ne $tenantId) {
-    throw "Azure context tenant does not match AZURE_TENANT_ID."
+    throw "Tenant mismatch. Verify AZURE_TENANT_ID and the OIDC app registration."
 }
 
-if ($context.Subscription.Id -ne $subscriptionId) {
-    throw "Azure context subscription does not match SUBSCRIPTION_ID."
+if (
+    $null -eq $context.Subscription -or
+    $context.Subscription.Id -ne $subscriptionId
+) {
+    Write-Host "Requested subscription is not selected. Checking access..."
+
+    $subscription = Get-AzSubscription `
+        -TenantId $tenantId `
+        -SubscriptionId $subscriptionId `
+        -ErrorAction Stop
+
+    if ($null -eq $subscription) {
+        throw "Requested subscription was not found in the configured tenant or the identity has no access."
+    }
+
+    Set-AzContext `
+        -SubscriptionObject $subscription `
+        -ErrorAction Stop | Out-Null
+}
+
+$context = Get-AzContext
+
+if (
+    $null -eq $context.Subscription -or
+    $context.Subscription.Id -ne $subscriptionId
+) {
+    throw "Azure subscription context verification failed."
 }
 
 Write-Host "Azure subscription context verified."
 
-# ---------------------------------------------------------
-# 4. Validate the VM and collect its dependencies
-# ---------------------------------------------------------
+# =========================================================
+# 4. Verify Azure CLI identity and subscription
+# =========================================================
+
+$accountJson = Invoke-AzCli `
+    -Arguments @("account", "show", "--output", "json") `
+    -Operation "Azure CLI account verification"
+
+$cliAccount = $accountJson | ConvertFrom-Json
+
+if ($cliAccount.id -ne $subscriptionId) {
+    throw "Azure CLI subscription does not match SUBSCRIPTION_ID."
+}
+
+if ($cliAccount.tenantId -ne $tenantId) {
+    throw "Azure CLI tenant does not match AZURE_TENANT_ID."
+}
+
+Write-Host "Azure CLI tenant and subscription verified."
+
+# =========================================================
+# 5. Validate VM and inventory dependencies
+# =========================================================
 
 $vm = Get-AzVM `
     -ResourceGroupName $resourceGroup `
@@ -123,24 +179,24 @@ $nicIds = @(
     Sort-Object -Unique
 )
 
-$nicDetails = [System.Collections.Generic.List[object]]::new()
+$nicInventory = [System.Collections.Generic.List[object]]::new()
 $publicIpIds = [System.Collections.Generic.List[string]]::new()
 $nsgIds = [System.Collections.Generic.List[string]]::new()
 
 foreach ($nicId in $nicIds) {
-    $nicParts = $nicId.Trim("/").Split("/")
-    $rgIndex = [Array]::IndexOf($nicParts, "resourceGroups")
+    $parts = $nicId.Trim("/").Split("/")
+    $rgIndex = [Array]::IndexOf($parts, "resourceGroups")
 
-    if ($rgIndex -lt 0 -or $rgIndex + 1 -ge $nicParts.Length) {
+    if ($rgIndex -lt 0 -or $rgIndex + 1 -ge $parts.Length) {
         throw "Unable to parse NIC resource ID: $nicId"
     }
 
-    $nicRg = $nicParts[$rgIndex + 1]
-    $nicResourceName = $nicParts[-1]
+    $nicRg = $parts[$rgIndex + 1]
+    $nicName = $parts[-1]
 
     $nic = Get-AzNetworkInterface `
         -ResourceGroupName $nicRg `
-        -Name $nicResourceName `
+        -Name $nicName `
         -ErrorAction Stop
 
     $nicPublicIps = @(
@@ -155,122 +211,100 @@ foreach ($nicId in $nicIds) {
         $nicNsgIds += $nic.NetworkSecurityGroup.Id
     }
 
-    foreach ($publicIpId in $nicPublicIps) {
-        $publicIpIds.Add([string]$publicIpId)
+    foreach ($id in $nicPublicIps) {
+        $publicIpIds.Add([string]$id)
     }
 
-    foreach ($nsgId in $nicNsgIds) {
-        $nsgIds.Add([string]$nsgId)
+    foreach ($id in $nicNsgIds) {
+        $nsgIds.Add([string]$id)
     }
 
-    $nicDetails.Add([pscustomobject]@{
-        Name             = $nic.Name
-        ResourceId       = $nic.Id
-        Location         = $nic.Location
-        PublicIPIds      = $nicPublicIps
+    $subnetIds = @(
+        $nic.IpConfigurations |
+        ForEach-Object { $_.Subnet.Id } |
+        Where-Object { $_ } |
+        Sort-Object -Unique
+    )
+
+    $nicInventory.Add([pscustomobject]@{
+        Name                    = $nic.Name
+        ResourceId              = $nic.Id
+        Location                = $nic.Location
+        PublicIPIds             = $nicPublicIps
         NetworkSecurityGroupIds = $nicNsgIds
-        SubnetIds        = @(
-            $nic.IpConfigurations |
-            ForEach-Object { $_.Subnet.Id } |
-            Where-Object { $_ } |
-            Sort-Object -Unique
-        )
+        SubnetIds               = $subnetIds
     })
 }
 
+$publicIpIds = @($publicIpIds | Sort-Object -Unique)
+$nsgIds = @($nsgIds | Sort-Object -Unique)
+
 $osDiskId = $vm.StorageProfile.OsDisk.ManagedDisk.Id
 
-$dataDiskDetails = @(
+$dataDisks = @(
     $vm.StorageProfile.DataDisks |
     ForEach-Object {
         [pscustomobject]@{
-            Name       = $_.Name
-            Lun        = $_.Lun
+            Name          = $_.Name
+            Lun           = $_.Lun
             ManagedDiskId = $_.ManagedDisk.Id
         }
     }
 )
 
-$publicIpIds = @($publicIpIds | Sort-Object -Unique)
-$nsgIds = @($nsgIds | Sort-Object -Unique)
-
 Write-Host "NIC count: $($nicIds.Count)"
 Write-Host "Public IP count: $($publicIpIds.Count)"
 Write-Host "NIC-associated NSG count: $($nsgIds.Count)"
-Write-Host "Data disk count: $($dataDiskDetails.Count)"
+Write-Host "Data disk count: $($dataDisks.Count)"
 
-# ---------------------------------------------------------
-# 5. Build the request and inventory
-# ---------------------------------------------------------
+$inventory = [ordered]@{
+    VMName                  = $vm.Name
+    VMResourceId            = $vm.Id
+    Location                = $vm.Location
+    ResourceGroup           = $resourceGroup
+    SubscriptionId          = $subscriptionId
+    NICs                    = @($nicInventory)
+    PublicIPIds             = @($publicIpIds)
+    NetworkSecurityGroupIds = @($nsgIds)
+    OSDiskId                = $osDiskId
+    DataDisks               = @($dataDisks)
+}
 
-$requestId = [guid]::NewGuid().ToString()
+# =========================================================
+# 6. Build request and write a diagnostic summary
+# =========================================================
+
 $partitionKey = $environment
 $rowKey = $requestId
 
-$inventory = [ordered]@{
-    VMName          = $vm.Name
-    VMResourceId    = $vm.Id
-    Location        = $vm.Location
-    ResourceGroup   = $resourceGroup
-    SubscriptionId  = $subscriptionId
-    NICs            = @($nicDetails)
-    PublicIPIds     = @($publicIpIds)
-    NetworkSecurityGroupIds = @($nsgIds)
-    OSDiskId        = $osDiskId
-    DataDisks       = @($dataDiskDetails)
-}
-
-$inventoryJson = $inventory | ConvertTo-Json -Depth 15 -Compress
-
 $request = [ordered]@{
-    RequestId             = $requestId
-    RequestStatus         = "PendingApproval"
-    Environment           = $environment
-    Requester             = $requester
-    SubscriptionId        = $subscriptionId
-    ResourceGroup         = $resourceGroup
-    VMName                = $vm.Name
-    VMResourceId          = $vm.Id
-    CreatedUtc            = $createdUtc.ToString("o")
-    ScheduledEligibilityUtc = $eligibilityUtc.ToString("o")
-    WaitDays              = $waitDays
-    ResourceInventory     = $inventory
+    RequestId                 = $requestId
+    RequestStatus             = "PendingApproval"
+    Environment               = $environment
+    Requester                 = $requester
+    SubscriptionId            = $subscriptionId
+    ResourceGroup             = $resourceGroup
+    VMName                    = $vm.Name
+    VMResourceId              = $vm.Id
+    CreatedUtc                = $createdUtc.ToString("o")
+    ScheduledEligibilityUtc   = $eligibilityUtc.ToString("o")
+    WaitDays                  = $waitDays
+    ResourceInventory         = $inventory
+    StorageStatus             = "Pending"
+    NotificationStatus        = "NotConfigured"
 }
-
-# Write a summary even if a later Storage operation fails.
-$summaryPath = Join-Path $env:GITHUB_WORKSPACE "decommission-request-summary.json"
 
 $request |
     ConvertTo-Json -Depth 15 |
     Set-Content -Path $summaryPath -Encoding utf8
 
-Write-Host "Request ID: $requestId"
-Write-Host "Request summary created: $summaryPath"
+# =========================================================
+# 7. Check Table Storage access and table existence
+# =========================================================
 
-# ---------------------------------------------------------
-# 6. Verify Storage Table access and ensure table exists
-# ---------------------------------------------------------
+Write-Host "Checking Table Storage access..."
 
-Write-Host "Checking Azure CLI authentication..."
-$cliAccount = Invoke-AzCli `
-    -Arguments @("account", "show", "--output", "json") `
-    -Operation "Azure CLI account check"
-
-$cliAccountObject = $cliAccount | ConvertFrom-Json
-
-if ($cliAccountObject.id -ne $subscriptionId) {
-    throw "Azure CLI subscription differs from the requested subscription."
-}
-
-if ($cliAccountObject.tenantId -ne $tenantId) {
-    throw "Azure CLI tenant differs from AZURE_TENANT_ID."
-}
-
-Write-Host "Azure CLI tenant and subscription verified."
-
-Write-Host "Checking Storage Table access..."
-
-$existsOutput = Invoke-AzCli `
+$existsJson = Invoke-AzCli `
     -Arguments @(
         "storage", "table", "exists",
         "--account-name", $storageAccount,
@@ -280,10 +314,10 @@ $existsOutput = Invoke-AzCli `
     ) `
     -Operation "Storage Table existence check"
 
-$existsResult = $existsOutput | ConvertFrom-Json
+$existsResult = $existsJson | ConvertFrom-Json
 
 if (-not $existsResult.exists) {
-    Write-Host "Table does not exist. Creating it..."
+    Write-Host "Table does not exist. Attempting to create it..."
 
     $null = Invoke-AzCli `
         -Arguments @(
@@ -298,12 +332,14 @@ if (-not $existsResult.exists) {
 
 Write-Host "Storage Table existence check passed."
 
-# ---------------------------------------------------------
-# 7. Insert the request using Microsoft Entra / OIDC auth
-# ---------------------------------------------------------
+# =========================================================
+# 8. Insert entity into Table Storage
+# =========================================================
 
-# Azure Table entity properties are passed as separate CLI arguments.
-# Keep each key=value pair as one argument to preserve spaces in values.
+# Store inventory as JSON text in one Table property.
+# The whole key=value pair is passed as a single CLI argument.
+
+$inventoryJson = $inventory | ConvertTo-Json -Depth 15 -Compress
 
 $entityProperties = @(
     "PartitionKey=$partitionKey"
@@ -322,7 +358,7 @@ $entityProperties = @(
     "ResourceInventoryJson=$inventoryJson"
 )
 
-Write-Host "Inserting request into Azure Table Storage..."
+Write-Host "Inserting request entity..."
 
 $insertArguments = @(
     "storage", "entity", "insert",
@@ -333,20 +369,18 @@ $insertArguments = @(
     "--entity"
 ) + $entityProperties
 
-$insertOutput = Invoke-AzCli `
+$insertResponse = Invoke-AzCli `
     -Arguments $insertArguments `
-    -Operation "Azure Table Storage entity insert"
+    -Operation "Storage Table entity insert"
 
-Write-Host "Storage insert response:"
-Write-Host $insertOutput
-Write-Host "Request successfully saved to Azure Table Storage."
+Write-Host "Table insert response:"
+Write-Host $insertResponse
 
-# ---------------------------------------------------------
-# 8. Optional notification webhook
-# ---------------------------------------------------------
+$request.StorageStatus = "Saved"
 
-$notificationStatus = "NotConfigured"
-$webhook = $env:DECOMMISSION_NOTIFICATION_WEBHOOK
+# =========================================================
+# 9. Optional notification webhook
+# =========================================================
 
 if (-not [string]::IsNullOrWhiteSpace($webhook)) {
     if (-not $webhook.StartsWith("https://")) {
@@ -354,13 +388,13 @@ if (-not [string]::IsNullOrWhiteSpace($webhook)) {
     }
 
     $notificationPayload = [ordered]@{
-        event       = "VMDecommissionRequestCreated"
-        requestId   = $requestId
-        environment = $environment
-        requester   = $requester
-        vmName      = $vm.Name
-        resourceGroup = $resourceGroup
-        status      = "PendingApproval"
+        event          = "VMDecommissionRequestCreated"
+        requestId      = $requestId
+        environment    = $environment
+        requester      = $requester
+        vmName         = $vm.Name
+        resourceGroup  = $resourceGroup
+        status         = "PendingApproval"
         eligibilityUtc = $eligibilityUtc.ToString("o")
     } | ConvertTo-Json -Depth 5
 
@@ -372,54 +406,32 @@ if (-not [string]::IsNullOrWhiteSpace($webhook)) {
             -Body $notificationPayload `
             -ErrorAction Stop | Out-Null
 
-        $notificationStatus = "Sent"
-        Write-Host "Notification webhook completed."
+        $request.NotificationStatus = "Sent"
+        Write-Host "Notification sent."
     }
     catch {
-        $notificationStatus = "Failed"
+        $request.NotificationStatus = "Failed"
         Write-Warning "Request was saved, but notification failed: $($_.Exception.Message)"
     }
 }
 else {
-    Write-Host "Notification webhook is not configured. Skipping notification."
+    Write-Host "Notification webhook not configured; skipping notification."
 }
 
-# ---------------------------------------------------------
-# 9. Update summary with final status
-# ---------------------------------------------------------
+# =========================================================
+# 10. Save final summary
+# =========================================================
 
-$requestSummary = [ordered]@{
-    RequestId               = $requestId
-    RequestStatus           = "PendingApproval"
-    Environment             = $environment
-    Requester               = $requester
-    SubscriptionId          = $subscriptionId
-    ResourceGroup           = $resourceGroup
-    VMName                  = $vm.Name
-    VMResourceId            = $vm.Id
-    CreatedUtc              = $createdUtc.ToString("o")
-    ScheduledEligibilityUtc = $eligibilityUtc.ToString("o")
-    WaitDays                = $waitDays
-    NICCount                = $nicIds.Count
-    PublicIPCount           = $publicIpIds.Count
-    NetworkSecurityGroupCount = $nsgIds.Count
-    DataDiskCount           = $dataDiskDetails.Count
-    StorageAccount          = $storageAccount
-    TableName               = $tableName
-    NotificationStatus      = $notificationStatus
-    ResourceInventory       = $inventory
-}
-
-$requestSummary |
+$request |
     ConvertTo-Json -Depth 15 |
     Set-Content -Path $summaryPath -Encoding utf8
 
-Write-Host "---------------------------------------------"
+Write-Host "============================================="
 Write-Host "DECOMMISSION REQUEST CREATED"
 Write-Host "Request ID: $requestId"
 Write-Host "Status: PendingApproval"
-Write-Host "Environment: $environment"
-Write-Host "Scheduled eligibility UTC: $($eligibilityUtc.ToString('o'))"
-Write-Host "Notification: $notificationStatus"
+Write-Host "Storage status: $($request.StorageStatus)"
+Write-Host "Notification status: $($request.NotificationStatus)"
+Write-Host "Eligibility UTC: $($eligibilityUtc.ToString('o'))"
 Write-Host "No Azure resources were deleted."
-Write-Host "---------------------------------------------"
+Write-Host "============================================="
