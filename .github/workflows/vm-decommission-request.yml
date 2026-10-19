@@ -1,30 +1,30 @@
 
-name: Azure VM Decommission - Request
+name: Azure VM Decommission Request
 
 on:
   workflow_dispatch:
     inputs:
       subscription_id:
-        description: "Azure Subscription ID containing the VM"
+        description: Azure Subscription ID
         required: true
         type: string
       resource_group:
-        description: "Resource Group Name"
+        description: Resource Group Name
         required: true
         type: string
       vm_name:
-        description: "Virtual Machine Name"
+        description: Virtual Machine Name
         required: true
         type: string
       environment:
-        description: "Environment"
+        description: Environment
         required: true
         type: choice
         options:
           - Dev
           - Prod
       requester:
-        description: "Request Raised By"
+        description: Request Raised By
         required: true
         type: string
 
@@ -33,8 +33,7 @@ permissions:
   id-token: write
 
 jobs:
-  submit-decommission-request:
-    name: Validate VM and Create Request
+  submit-request:
     runs-on: ubuntu-latest
 
     steps:
@@ -47,26 +46,56 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ inputs.subscription_id }}
-          enable-AzPSSession: true
 
-      - name: Validate VM and Save Request
-        uses: azure/powershell@v2
+      - name: Verify Azure and Storage Table
+        shell: pwsh
+        env:
+          STORAGE_ACCOUNT: shubhamstorage11
+          TABLE_NAME: VMDecommissionRequests
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=== Azure CLI identity ==="
+          az account show --query "{subscription:id,tenant:tenantId,user:user}" --output json
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Azure CLI authentication check failed."
+          }
+
+          Write-Host "=== Check Table ==="
+          az storage table exists `
+            --account-name $env:STORAGE_ACCOUNT `
+            --name $env:TABLE_NAME `
+            --auth-mode login `
+            --output json
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to check Storage Table. Review the Azure CLI error above."
+          }
+
+          Write-Host "=== Create Table if missing ==="
+          az storage table create `
+            --account-name $env:STORAGE_ACCOUNT `
+            --name $env:TABLE_NAME `
+            --auth-mode login `
+            --output json
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Table creation failed. Review the Azure CLI error above."
+          }
+
+      - name: Validate VM and Insert Request
+        shell: pwsh
         env:
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
           VM_NAME: ${{ inputs.vm_name }}
           VM_ENVIRONMENT: ${{ inputs.environment }}
           REQUESTER: ${{ inputs.requester }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
-          DECOMMISSION_NOTIFICATION_WEBHOOK: ${{ secrets.DECOMMISSION_NOTIFICATION_WEBHOOK }}
-        with:
-          azPSVersion: latest
-          inlineScript: |
-            $ErrorActionPreference = "Stop"
-            Set-Location $env:GITHUB_WORKSPACE
-            & "$env:GITHUB_WORKSPACE/scripts/Submit-VMDecommissionRequest.ps1"
+        run: |
+          ./scripts/Submit-VMDecommissionRequest.ps1
 
       - name: Upload Request Summary
         if: always()
