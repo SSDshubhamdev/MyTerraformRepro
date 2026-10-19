@@ -1,0 +1,29 @@
+
+name: Azure OIDC Authentication Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  authenticate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Azure Login using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure Authentication
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az account show \
+              --query "{subscription:name, subscriptionId:id, tenantId:tenantId}" \
+              --output table
