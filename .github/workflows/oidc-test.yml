@@ -1,4 +1,4 @@
-```yaml
+```yaml 
 name: Azure VM Decommission
 
 on:
