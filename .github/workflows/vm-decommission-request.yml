@@ -42,15 +42,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ---------------------------------------------
-      # 1. Checkout repository
-      # ---------------------------------------------
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------
-      # 2. Existing Azure OIDC login
-      # ---------------------------------------------
+      # Existing OIDC authentication pattern preserved
       - name: Azure login using OIDC
         uses: azure/login@v2
         with:
@@ -59,52 +54,6 @@ jobs:
           subscription-id: ${{ inputs.subscription_id }}
           enable-AzPSSession: true
 
-      # ---------------------------------------------
-      # 3. Verify Azure PowerShell context
-      # ---------------------------------------------
-      - name: Verify Azure Subscription
-        uses: azure/powershell@v2
-        with:
-          azPSVersion: latest
-          inlineScript: |
-            $ErrorActionPreference = "Stop"
-
-            $subscriptionId = "${{ inputs.subscription_id }}"
-            $tenantId = "${{ secrets.AZURE_TENANT_ID }}"
-
-            $context = Get-AzContext
-
-            if ($null -eq $context -or
-                $null -eq $context.Account) {
-              throw "Azure PowerShell authentication is missing. Check OIDC login."
-            }
-
-            $subscription = Get-AzSubscription `
-              -SubscriptionId $subscriptionId `
-              -TenantId $tenantId `
-              -ErrorAction Stop
-
-            if ($null -eq $subscription) {
-              throw "Subscription is unavailable to the logged-in identity."
-            }
-
-            Set-AzContext `
-              -SubscriptionObject $subscription `
-              -ErrorAction Stop | Out-Null
-
-            $verifiedContext = Get-AzContext
-
-            if ($verifiedContext.Subscription.Id -ne $subscriptionId) {
-              throw "Azure subscription context verification failed."
-            }
-
-            Write-Host "Azure subscription context verified."
-            Write-Host "Subscription ID: $($verifiedContext.Subscription.Id)"
-
-      # ---------------------------------------------
-      # 4. Validate VM, inventory dependencies,
-      #    and save the decommission request
-      # ---------------------------------------------
       - name: Validate VM and Save Request
         uses: azure/powershell@v2
         with:
@@ -123,9 +72,6 @@ jobs:
           TABLE_NAME: VMDecommissionRequests
           DECOMMISSION_NOTIFICATION_WEBHOOK: ${{ secrets.DECOMMISSION_NOTIFICATION_WEBHOOK }}
 
-      # ---------------------------------------------
-      # 5. Upload request summary for troubleshooting
-      # ---------------------------------------------
       - name: Upload Request Summary
         if: always()
         uses: actions/upload-artifact@v4
