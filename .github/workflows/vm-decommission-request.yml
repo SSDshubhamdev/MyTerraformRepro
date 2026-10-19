@@ -8,17 +8,14 @@ on:
         description: "Azure Subscription ID"
         required: true
         type: string
-
       resource_group:
         description: "Resource Group Name"
         required: true
         type: string
-
       vm_name:
         description: "Virtual Machine Name"
         required: true
         type: string
-
       environment:
         description: "Environment"
         required: true
@@ -26,7 +23,6 @@ on:
         options:
           - Dev
           - Prod
-
       requester:
         description: "Request Raised By"
         required: true
@@ -45,7 +41,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Existing OIDC authentication pattern preserved
       - name: Azure login using OIDC
         uses: azure/login@v2
         with:
@@ -56,11 +51,6 @@ jobs:
 
       - name: Validate VM and Save Request
         uses: azure/powershell@v2
-        with:
-          azPSVersion: latest
-          inlineScript: |
-            $ErrorActionPreference = "Stop"
-            ./scripts/Submit-VMDecommissionRequest.ps1
         env:
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
@@ -71,6 +61,12 @@ jobs:
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
           DECOMMISSION_NOTIFICATION_WEBHOOK: ${{ secrets.DECOMMISSION_NOTIFICATION_WEBHOOK }}
+        with:
+          azPSVersion: latest
+          inlineScript: |
+            $ErrorActionPreference = "Stop"
+            Set-Location $env:GITHUB_WORKSPACE
+            & "$env:GITHUB_WORKSPACE/scripts/Submit-VMDecommissionRequest.ps1"
 
       - name: Upload Request Summary
         if: always()
