@@ -1,29 +1,134 @@
 
-name: Azure OIDC Authentication Test
+name: Azure VM Decommission
 
 on:
   workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Azure Resource Group containing the VM"
+        required: true
+        type: string
+
+      vm_name:
+        description: "Exact Azure VM name to delete"
+        required: true
+        type: string
+
+      confirm_delete:
+        description: "Confirm VM deletion"
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  authenticate:
+  decommission:
+    name: Decommission Azure VM
     runs-on: ubuntu-latest
 
     steps:
-      - name: Azure Login using OIDC
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login using OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
 
-      - name: Verify Azure Authentication
-        uses: azure/cli@v2
+      - name: Validate Azure VM
+        uses: azure/powershell@v2
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+          VM_NAME: ${{ inputs.vm_name }}
+          CONFIRM_DELETION: ${{ inputs.confirm_delete }}
         with:
+          azPSVersion: latest
+          errorActionPreference: Stop
           inlineScript: |
-            az account show \
-              --query "{subscription:name, subscriptionId:id, tenantId:tenantId}" \
-              --output table
+            if ($env:CONFIRM_DELETION -ne "yes") {
+              throw "Deletion cancelled. Set confirm_delete to yes."
+            }
+
+            $context = Get-AzContext
+            if (-not $context -or -not $context.Subscription) {
+              throw "Azure PowerShell is not authenticated."
+            }
+
+            $vm = Get-AzVM `
+              -ResourceGroupName $env:RESOURCE_GROUP `
+              -Name $env:VM_NAME `
+              -ErrorAction Stop
+
+            Write-Host "VM found: $($vm.Name)"
+            Write-Host "Resource Group: $($vm.ResourceGroupName)"
+            Write-Host "Location: $($vm.Location)"
+
+      - name: Delete Azure VM using PowerShell script
+        uses: azure/powershell@v2
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+          VM_NAME: ${{ inputs.vm_name }}
+          CONFIRM_DELETION: ${{ inputs.confirm_delete }}
+        with:
+          azPSVersion: latest
+          errorActionPreference: Stop
+          inlineScript: |
+            if ($env:CONFIRM_DELETION -ne "yes") {
+              throw "Deletion cancelled. Set confirm_delete to yes."
+            }
+
+            $scriptPath = Join-Path $PWD "MyTerraformRepro/scripts/Delete-AzureVM.ps1"
+
+            if (-not (Test-Path $scriptPath -PathType Leaf)) {
+              Write-Host "Current workspace: $PWD"
+              Get-ChildItem -Path $PWD -Filter "Delete-AzureVM.ps1" -Recurse |
+                Select-Object -ExpandProperty FullName
+
+              throw "Deletion script not found: $scriptPath"
+            }
+
+            Write-Host "Found script: $scriptPath"
+
+            & $scriptPath `
+              -ResourceGroupName $env:RESOURCE_GROUP `
+              -VMName $env:VM_NAME `
+              -ConfirmDeletion $env:CONFIRM_DELETION
+
+      - name: Verify VM deletion
+        uses: azure/powershell@v2
+        env:
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+          VM_NAME: ${{ inputs.vm_name }}
+          CONFIRM_DELETION: ${{ inputs.confirm_delete }}
+        with:
+          azPSVersion: latest
+          errorActionPreference: Stop
+          inlineScript: |
+            if ($env:CONFIRM_DELETION -ne "yes") {
+              throw "Deletion was not confirmed."
+            }
+
+            $remainingVM = Get-AzVM `
+              -ResourceGroupName $env:RESOURCE_GROUP `
+              -Name $env:VM_NAME `
+              -ErrorAction SilentlyContinue
+
+            if ($null -ne $remainingVM) {
+              throw "VM still exists. Please investigate deletion status."
+            }
+
+            Write-Host "SUCCESS: VM resource deletion verified."
+
+      - name: Azure logout
+        if: always()
+        shell: bash
+        run: az logout
