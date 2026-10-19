@@ -3,13 +3,13 @@ $ErrorActionPreference = "Stop"
 
 # ============================================================
 # Azure VM Decommission Request
-# Authentication: GitHub Actions OIDC
+# Authentication : GitHub Actions OIDC
 # Storage Account: shubhamstorage11
-# Table: VMDecommissionRequests
-# IMPORTANT: This script does not delete the VM.
+# Table          : VMDecommissionRequests
+# Action         : Validate and save request only
 # ============================================================
 
-# STEP 1: Validate required environment variables
+# STEP 1: Validate inputs
 
 $requiredVariables = @(
     "SUBSCRIPTION_ID",
@@ -39,9 +39,7 @@ $tenantId       = $env:AZURE_TENANT_ID.Trim()
 $storageAccount = $env:STORAGE_ACCOUNT.Trim()
 $tableName      = $env:TABLE_NAME.Trim()
 
-# FIX: Valid PowerShell array syntax. Do not use "- Dev"
-# inside a PowerShell array.
-
+# Correct PowerShell syntax for environment validation.
 $allowedEnvironments = @("Dev", "Prod")
 
 if ($environment -notin $allowedEnvironments) {
@@ -51,26 +49,20 @@ if ($environment -notin $allowedEnvironments) {
 if ($environment -eq "Dev") {
     $waitDays = 7
 }
-elseif ($environment -eq "Prod") {
-    $waitDays = 11
-}
 else {
-    throw "Unable to determine the waiting period."
+    $waitDays = 11
 }
 
 Write-Host "Environment: $environment"
 Write-Host "Waiting period: $waitDays days"
 
-# STEP 2: Azure CLI helper
+# STEP 2: Azure CLI helper functions
 
 function Invoke-AzCli {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$Arguments
     )
-
-    Write-Host ""
-    Write-Host "Executing Azure CLI command..." -ForegroundColor Cyan
 
     $output = & az @Arguments 2>&1
     $exitCode = $LASTEXITCODE
@@ -81,7 +73,7 @@ function Invoke-AzCli {
     }
 
     if ($exitCode -ne 0) {
-        throw "Azure CLI failed with exit code $exitCode. Details: $outputText"
+        throw "Azure CLI command failed with exit code $exitCode. Details: $outputText"
     }
 
     return $outputText
@@ -103,11 +95,11 @@ function Invoke-AzCliJson {
         return ($outputText | ConvertFrom-Json)
     }
     catch {
-        throw "Unable to parse Azure CLI JSON response: $outputText"
+        throw "Failed to parse Azure CLI JSON output: $outputText"
     }
 }
 
-# STEP 3: Verify Azure CLI identity and subscription
+# STEP 3: Verify OIDC identity and subscription
 
 Write-Host "=== STEP 1: Verify Azure identity ===" -ForegroundColor Yellow
 
@@ -124,7 +116,7 @@ if (-not [string]::Equals(
     $tenantId,
     [StringComparison]::OrdinalIgnoreCase
 )) {
-    throw "Tenant mismatch. Check AZURE_TENANT_ID and the OIDC login configuration."
+    throw "Tenant mismatch. Check AZURE_TENANT_ID."
 }
 
 Invoke-AzCli -Arguments @(
@@ -141,12 +133,12 @@ if (-not [string]::Equals(
     $subscriptionId,
     [StringComparison]::OrdinalIgnoreCase
 )) {
-    throw "Azure CLI subscription does not match SUBSCRIPTION_ID."
+    throw "Subscription mismatch. Check SUBSCRIPTION_ID."
 }
 
 Write-Host "Azure tenant and subscription verified."
 
-# STEP 4: Validate the requested VM
+# STEP 4: Validate the VM
 
 Write-Host "=== STEP 2: Validate VM ===" -ForegroundColor Yellow
 
@@ -158,14 +150,14 @@ $vm = Invoke-AzCliJson -Arguments @(
 )
 
 if (-not $vm -or -not $vm.id) {
-    throw "VM not found: $vmName in resource group $resourceGroup."
+    throw "VM '$vmName' was not found in '$resourceGroup'."
 }
 
 Write-Host "VM Name: $($vm.name)"
-Write-Host "VM ID: $($vm.id)"
-Write-Host "Location: $($vm.location)"
+Write-Host "VM Resource ID: $($vm.id)"
+Write-Host "VM Location: $($vm.location)"
 
-# STEP 5: Collect VM dependencies
+# STEP 5: Collect dependencies
 
 Write-Host "=== STEP 3: Collect VM dependencies ===" -ForegroundColor Yellow
 
@@ -205,7 +197,6 @@ foreach ($nicId in $nicIds) {
     foreach ($ipConfig in @($nic.ipConfigurations)) {
 
         if ($ipConfig.publicIPAddress -and $ipConfig.publicIPAddress.id) {
-
             $publicIpId = $ipConfig.publicIPAddress.id
 
             $publicIpDetails += [PSCustomObject]@{
@@ -215,7 +206,6 @@ foreach ($nicId in $nicIds) {
         }
 
         if ($ipConfig.subnet -and $ipConfig.subnet.id) {
-
             $subnetId = $ipConfig.subnet.id
 
             if (-not ($subnetDetails | Where-Object { $_.Id -eq $subnetId })) {
@@ -296,7 +286,7 @@ Write-Host "Public IP count: $($inventory.PublicIPCount)"
 Write-Host "NSG count: $($inventory.NSGCount)"
 Write-Host "Data disk count: $($inventory.DataDiskCount)"
 
-# STEP 6: Check/create the Azure Table
+# STEP 6: Verify the table exists
 
 Write-Host "=== STEP 4: Verify Storage Table ===" -ForegroundColor Yellow
 
@@ -310,7 +300,7 @@ $tableResult = Invoke-AzCliJson -Arguments @(
 
 if (-not $tableResult.exists) {
 
-    Write-Host "Table not found. Creating table..."
+    Write-Host "Table missing. Creating table..."
 
     Invoke-AzCliJson -Arguments @(
         "storage", "table", "create",
@@ -320,15 +310,15 @@ if (-not $tableResult.exists) {
         "--output", "json"
     )
 
-    Write-Host "Table creation command completed."
+    Write-Host "Table creation completed."
 }
 else {
     Write-Host "Table already exists: $tableName"
 }
 
-# STEP 7: Create request entity
+# STEP 7: Build the entity
 
-Write-Host "=== STEP 5: Prepare request entity ===" -ForegroundColor Yellow
+Write-Host "=== STEP 5: Prepare request ===" -ForegroundColor Yellow
 
 $requestId = [guid]::NewGuid().ToString()
 $createdUtc = [DateTime]::UtcNow
@@ -336,68 +326,77 @@ $scheduledUtc = $createdUtc.AddDays($waitDays)
 
 $inventoryJson = $inventory | ConvertTo-Json -Depth 50 -Compress
 
-# Azure Table keys must not contain /, \, #, ?, or control characters.
+# Azure Table keys cannot contain /, \, #, ?, or control characters.
 $partitionKey = $subscriptionId
 $rowKey = $requestId
 
-# Use a JSON entity document rather than splitting property values
-# on spaces or "=" in PowerShell.
-$entity = [ordered]@{
-    PartitionKey            = $partitionKey
-    RowKey                  = $rowKey
-    RequestId               = $requestId
-    RequestStatus           = "PendingApproval"
-    Environment             = $environment
-    Requester               = $requester
-    SubscriptionId          = $subscriptionId
-    ResourceGroup           = $resourceGroup
-    VMName                  = $vmName
-    VMResourceId            = [string]$vm.id
-    CreatedUtc              = $createdUtc.ToString("o")
-    ScheduledEligibilityUtc = $scheduledUtc.ToString("o")
-    WaitDays                = $waitDays
-    ResourceInventoryJson   = $inventoryJson
+# Azure Tables limits a single property to 64 KiB.
+# Reject oversized inventory rather than silently truncating it.
+$inventoryBytes = [System.Text.Encoding]::UTF8.GetByteCount($inventoryJson)
+
+if ($inventoryBytes -gt 60000) {
+    throw "Resource inventory JSON is too large for one Table property ($inventoryBytes bytes). Store the inventory in a Blob and save its URI in the table instead."
 }
 
-$entityFile = Join-Path $PWD "decommission-table-entity.json"
-
-$entity |
-    ConvertTo-Json -Depth 50 |
-    Set-Content -Path $entityFile -Encoding utf8
-
 Write-Host "Request ID: $requestId"
-Write-Host "Table: $tableName"
-Write-Host "Status: PendingApproval"
+Write-Host "Target table: $tableName"
 
-# STEP 8: Insert the entity into Table Storage
+# STEP 8: Insert entity using separate key=value arguments.
+# FIX: Do not pass --entity "@file"; Azure CLI parses it as a
+# property declaration and raises the dictionary update error.
 
 Write-Host "=== STEP 6: Insert request into Azure Table ===" -ForegroundColor Yellow
 
+$entityProperties = @(
+    "PartitionKey=$partitionKey"
+    "RowKey=$rowKey"
+    "RequestId=$requestId"
+    "RequestStatus=PendingApproval"
+    "Environment=$environment"
+    "Requester=$requester"
+    "SubscriptionId=$subscriptionId"
+    "ResourceGroup=$resourceGroup"
+    "VMName=$vmName"
+    "VMResourceId=$($vm.id)"
+    "CreatedUtc=$($createdUtc.ToString('o'))"
+    "ScheduledEligibilityUtc=$($scheduledUtc.ToString('o'))"
+    "WaitDays=$waitDays"
+    "ResourceInventoryJson=$inventoryJson"
+)
+
+$insertArguments = @(
+    "storage"
+    "entity"
+    "insert"
+    "--account-name"
+    $storageAccount
+    "--table-name"
+    $tableName
+    "--auth-mode"
+    "login"
+    "--entity"
+) + $entityProperties + @(
+    "--output"
+    "json"
+)
+
 try {
-    Invoke-AzCliJson -Arguments @(
-        "storage", "entity", "insert",
-        "--account-name", $storageAccount,
-        "--table-name", $tableName,
-        "--auth-mode", "login",
-        "--entity", "@$entityFile",
-        "--output", "json"
-    )
+    $insertOutput = Invoke-AzCli -Arguments $insertArguments
+    Write-Host "Request entity inserted successfully." -ForegroundColor Green
 }
 catch {
-    throw "Failed to insert request into Azure Table '$tableName'. Verify the exact Azure CLI error and Storage Table Data Contributor permissions. Details: $($_.Exception.Message)"
+    throw "Failed to insert request into '$tableName'. Azure CLI details: $($_.Exception.Message)"
 }
 
-Write-Host "Request entity inserted successfully." -ForegroundColor Green
+# STEP 9: Save a summary artifact
 
-# STEP 9: Create workflow summary artifact
-
-Write-Host "=== STEP 7: Write summary ===" -ForegroundColor Yellow
+Write-Host "=== STEP 7: Create summary ===" -ForegroundColor Yellow
 
 $summary = [PSCustomObject]@{
     RequestId               = $requestId
     RequestStatus           = "PendingApproval"
     SubscriptionId          = $subscriptionId
-    ResourceGroup           = $resourceGroup
+    ResourceGroup            = $resourceGroup
     VMName                  = $vm.name
     Environment             = $environment
     Requester               = $requester
@@ -405,7 +404,7 @@ $summary = [PSCustomObject]@{
     ScheduledEligibilityUtc = $scheduledUtc.ToString("o")
     WaitDays                = $waitDays
     StorageAccount          = $storageAccount
-    TableName               = $tableName
+    TableName                = $tableName
     Inventory               = $inventory
 }
 
