@@ -1,110 +1,299 @@
 
-name: Azure VM Decommission - Request
+$ErrorActionPreference = "Stop"
 
-on:
-  workflow_dispatch:
-    inputs:
-      subscription_id:
-        description: "Azure Subscription ID"
-        required: true
-        type: string
-      resource_group:
-        description: "Resource Group Name"
-        required: true
-        type: string
-      vm_name:
-        description: "Virtual Machine Name"
-        required: true
-        type: string
-      environment:
-        description: "Environment"
-        required: true
-        type: choice
-        options:
-          - Dev
-          - Prod
-      requester:
-        description: "Request Raised By"
-        required: true
-        type: string
+# =========================================================
+# 1. Read GitHub Actions inputs
+# =========================================================
+$subscriptionId = $env:SUBSCRIPTION_ID
+$resourceGroup  = $env:RESOURCE_GROUP
+$vmName         = $env:VM_NAME
+$environment    = $env:VM_ENVIRONMENT
+$requester      = $env:REQUESTER
+$tenantId       = $env:AZURE_TENANT_ID
+$storageAccount = $env:STORAGE_ACCOUNT
+$tableName      = $env:TABLE_NAME
+$webhookUrl     = $env:DECOMMISSION_NOTIFICATION_WEBHOOK
 
-permissions:
-  contents: read
-  id-token: write
+if ([string]::IsNullOrWhiteSpace($subscriptionId) -or
+    [string]::IsNullOrWhiteSpace($resourceGroup) -or
+    [string]::IsNullOrWhiteSpace($vmName) -or
+    [string]::IsNullOrWhiteSpace($requester) -or
+    [string]::IsNullOrWhiteSpace($tenantId) -or
+    [string]::IsNullOrWhiteSpace($storageAccount) -or
+    [string]::IsNullOrWhiteSpace($tableName)) {
+    throw "One or more required pipeline inputs are missing."
+}
 
-jobs:
-  submit-decommission-request:
-    runs-on: ubuntu-latest
+if ($environment -notin @("Dev", "Prod")) {
+    throw "Environment must be Dev or Prod."
+}
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+$parsedSubscriptionId = [guid]::Empty
+if (-not [guid]::TryParse(
+    $subscriptionId,
+    [ref]$parsedSubscriptionId
+)) {
+    throw "Subscription ID must be a valid GUID."
+}
 
-      - name: Azure login using OIDC
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ inputs.subscription_id }}
-          enable-AzPSSession: true
+$waitingDays = if ($environment -eq "Dev") { 7 } else { 11 }
 
-      - name: Verify Azure Subscription Context
-        uses: azure/powershell@v2
-        with:
-          azPSVersion: latest
-          inlineScript: |
-            $ErrorActionPreference = "Stop"
+$requestId = [guid]::NewGuid().ToString()
+$requestedAt = [DateTime]::UtcNow
+$scheduledAt = $requestedAt.AddDays($waitingDays)
 
-            $subscriptionId = "${{ inputs.subscription_id }}"
-            $tenantId = "${{ secrets.AZURE_TENANT_ID }}"
+Write-Host "Request ID: $requestId"
+Write-Host "Environment: $environment"
+Write-Host "Scheduled eligibility date UTC: $($scheduledAt.ToString('o'))"
 
-            $context = Get-AzContext
+# =========================================================
+# 2. Verify Azure PowerShell authentication and subscription
+# =========================================================
+$currentContext = Get-AzContext
 
-            if ($null -eq $context -or
-                $null -eq $context.Account) {
-              throw "Azure PowerShell is not authenticated. Check OIDC login."
-            }
+if ($null -eq $currentContext -or
+    $null -eq $currentContext.Account) {
+    throw "Azure PowerShell is not authenticated. Check azure/login@v2 OIDC configuration."
+}
 
-            $subscription = Get-AzSubscription `
-              -SubscriptionId $subscriptionId `
-              -TenantId $tenantId `
-              -ErrorAction Stop
+$subscription = Get-AzSubscription `
+    -SubscriptionId $subscriptionId `
+    -TenantId $tenantId `
+    -ErrorAction Stop
 
-            if ($null -eq $subscription) {
-              throw "Subscription not found or not accessible to this identity."
-            }
+if ($null -eq $subscription) {
+    throw "Subscription not found or not accessible to the OIDC identity."
+}
 
-            Set-AzContext `
-              -SubscriptionObject $subscription `
-              -ErrorAction Stop | Out-Null
+Set-AzContext `
+    -SubscriptionObject $subscription `
+    -ErrorAction Stop | Out-Null
 
-            $verifiedContext = Get-AzContext
+$verifiedContext = Get-AzContext
 
-            Write-Host "Authenticated Azure account successfully."
-            Write-Host "Subscription ID: $($verifiedContext.Subscription.Id)"
-            Write-Host "Tenant ID: $($verifiedContext.Tenant.Id)"
+if ($verifiedContext.Subscription.Id -ne $subscriptionId) {
+    throw "Azure subscription context verification failed."
+}
 
-      - name: Validate VM and Save Request
-        uses: azure/powershell@v2
-        with:
-          azPSVersion: latest
-          inlineScript: ./scripts/Submit-VMDecommissionRequest.ps1
-        env:
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
-          RESOURCE_GROUP: ${{ inputs.resource_group }}
-          VM_NAME: ${{ inputs.vm_name }}
-          VM_ENVIRONMENT: ${{ inputs.environment }}
-          REQUESTER: ${{ inputs.requester }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          STORAGE_ACCOUNT: shubhamstorage11
-          TABLE_NAME: VMDecommissionRequests
-          DECOMMISSION_NOTIFICATION_WEBHOOK: ${{ secrets.DECOMMISSION_NOTIFICATION_WEBHOOK }}
+Write-Host "Azure subscription context verified."
 
-      - name: Upload Request Summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vm-decommission-request-summary
-          path: decommission-request-summary.json
-          if-no-files-found: ignore
-          retention-days: 30
+# =========================================================
+# 3. Validate VM
+# =========================================================
+$vm = Get-AzVM `
+    -ResourceGroupName $resourceGroup `
+    -Name $vmName `
+    -ErrorAction Stop
+
+if ([string]::IsNullOrWhiteSpace($vm.Id)) {
+    throw "VM resource ID was not returned."
+}
+
+Write-Host "VM found: $($vm.Name)"
+Write-Host "VM Resource ID: $($vm.Id)"
+
+# =========================================================
+# 4. Inventory NIC, Public IP, NSG and disks
+# =========================================================
+$nicIds = @(
+    $vm.NetworkProfile.NetworkInterfaces |
+        ForEach-Object { $_.Id } |
+        Where-Object { $_ }
+)
+
+if ($nicIds.Count -eq 0) {
+    throw "No NICs found on this VM. Request requires manual review."
+}
+
+$nicInventory = @()
+$publicIpIds = @()
+$nsgIds = @()
+
+foreach ($nicId in $nicIds) {
+    $nic = Get-AzNetworkInterface `
+        -ResourceId $nicId `
+        -ErrorAction Stop
+
+    $attachedVmId = $nic.VirtualMachine.Id
+
+    if ([string]::IsNullOrWhiteSpace($attachedVmId) -or
+        $attachedVmId.TrimEnd("/") -ine $vm.Id.TrimEnd("/")) {
+        throw "NIC attachment validation failed: $nicId"
+    }
+
+    $nicPublicIps = @(
+        $nic.IpConfigurations |
+            ForEach-Object { $_.PublicIpAddress.Id } |
+            Where-Object { $_ }
+    )
+
+    $nicNsgId = $nic.NetworkSecurityGroup.Id
+
+    if ($nicNsgId) {
+        $nsgIds += $nicNsgId
+    }
+
+    $publicIpIds += $nicPublicIps
+
+    $nicInventory += [PSCustomObject]@{
+        Name = $nic.Name
+        ResourceId = $nic.Id
+        PublicIPIds = @($nicPublicIps)
+        NetworkSecurityGroupId = $nicNsgId
+    }
+}
+
+$publicIpIds = @($publicIpIds | Sort-Object -Unique)
+$nsgIds = @($nsgIds | Sort-Object -Unique)
+
+$osDiskId = $vm.StorageProfile.OsDisk.ManagedDisk.Id
+
+$dataDiskIds = @(
+    $vm.StorageProfile.DataDisks |
+        ForEach-Object { $_.ManagedDisk.Id } |
+        Where-Object { $_ }
+)
+
+Write-Host "NIC count: $($nicInventory.Count)"
+Write-Host "Public IP count: $($publicIpIds.Count)"
+Write-Host "NSG count: $($nsgIds.Count)"
+Write-Host "Data disk count: $($dataDiskIds.Count)"
+
+# =========================================================
+# 5. Build request and inventory JSON
+# =========================================================
+$nicJson = ConvertTo-Json -InputObject @($nicInventory) -Depth 10 -Compress
+$publicIpJson = ConvertTo-Json -InputObject @($publicIpIds) -Compress
+$nsgJson = ConvertTo-Json -InputObject @($nsgIds) -Compress
+$dataDiskJson = ConvertTo-Json -InputObject @($dataDiskIds) -Compress
+
+$summary = [PSCustomObject]@{
+    RequestId = $requestId
+    SubscriptionId = $subscriptionId
+    ResourceGroupName = $resourceGroup
+    VMName = $vm.Name
+    VMResourceId = $vm.Id
+    Environment = $environment
+    Location = $vm.Location
+    NICs = @($nicInventory)
+    PublicIPResourceIds = @($publicIpIds)
+    NSGResourceIds = @($nsgIds)
+    OSDiskResourceId = $osDiskId
+    DataDiskResourceIds = @($dataDiskIds)
+    RequestedBy = $requester
+    RequestedAtUtc = $requestedAt.ToString("o")
+    ScheduledDeletionAtUtc = $scheduledAt.ToString("o")
+    ApprovalStatus = "Pending"
+    DecommissionStatus = "PendingApproval"
+    NotificationStatus = "Pending"
+}
+
+$summary |
+    ConvertTo-Json -Depth 10 |
+    Set-Content -Path "decommission-request-summary.json" -Encoding utf8
+
+# =========================================================
+# 6. Create Azure Storage Table
+# Requires Azure CLI login and Table data permissions
+# =========================================================
+$null = & az storage table create `
+    --name $tableName `
+    --account-name $storageAccount `
+    --auth-mode login `
+    --output none
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to create or access the Azure Storage Table. Check Azure CLI login and Storage Table data permissions."
+}
+
+# =========================================================
+# 7. Save request in Azure Table Storage
+# PartitionKey = subscription ID
+# RowKey       = request ID
+# =========================================================
+$entityArgs = @(
+    "PartitionKey=$subscriptionId"
+    "RowKey=$requestId"
+    "RequestId=$requestId"
+    "ResourceGroupName=$resourceGroup"
+    "VMName=$($vm.Name)"
+    "VMResourceId=$($vm.Id)"
+    "Environment=$environment"
+    "Location=$($vm.Location)"
+    "NICsJson=$nicJson"
+    "PublicIPResourceIdsJson=$publicIpJson"
+    "NSGResourceIdsJson=$nsgJson"
+    "OSDiskResourceId=$osDiskId"
+    "DataDiskResourceIdsJson=$dataDiskJson"
+    "RequestedBy=$requester"
+    "RequestedAtUtc=$($requestedAt.ToString('o'))"
+    "ScheduledDeletionAtUtc=$($scheduledAt.ToString('o'))"
+    "ApprovalStatus=Pending"
+    "DecommissionStatus=PendingApproval"
+    "NotificationStatus=Pending"
+)
+
+$null = & az storage entity insert `
+    --account-name $storageAccount `
+    --table-name $tableName `
+    --auth-mode login `
+    --if-exists fail `
+    --entity @entityArgs `
+    --output none
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to save request in Azure Table Storage."
+}
+
+Write-Host "Request successfully saved to $storageAccount/$tableName"
+
+# =========================================================
+# 8. Notify customer through configured HTTPS webhook
+# =========================================================
+if (-not [string]::IsNullOrWhiteSpace($webhookUrl)) {
+    if ($webhookUrl -notmatch '^https://') {
+        throw "Notification webhook must use HTTPS."
+    }
+
+    $payload = @{
+        event = "AzureVMDecommissionRequested"
+        requestId = $requestId
+        subscriptionId = $subscriptionId
+        resourceGroup = $resourceGroup
+        vmName = $vm.Name
+        environment = $environment
+        requestedBy = $requester
+        scheduledDeletionAtUtc = $scheduledAt.ToString("o")
+        approvalStatus = "Pending"
+        message = "Decommission request created. No Azure resources have been deleted."
+    } | ConvertTo-Json -Depth 5
+
+    Invoke-RestMethod `
+        -Uri $webhookUrl `
+        -Method Post `
+        -ContentType "application/json" `
+        -Body $payload `
+        -ErrorAction Stop | Out-Null
+
+    $null = & az storage entity merge `
+        --account-name $storageAccount `
+        --table-name $tableName `
+        --auth-mode login `
+        --partition-key $subscriptionId `
+        --row-key $requestId `
+        --entity "NotificationStatus=Sent" "NotificationSentAtUtc=$([DateTime]::UtcNow.ToString('o'))" `
+        --output none
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Notification was sent, but its status could not be updated in the table."
+    }
+
+    Write-Host "Customer notification sent."
+}
+else {
+    Write-Warning "Webhook is not configured. Request saved, but customer notification was not sent."
+}
+
+Write-Host "Pipeline 1 completed successfully."
+Write-Host "Request ID: $requestId"
+Write-Host "No resources were deleted."
