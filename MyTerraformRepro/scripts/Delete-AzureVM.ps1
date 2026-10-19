@@ -15,20 +15,21 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidateSet("yes", "no")]
-    [string]$ConfirmDeletion
+    [string]$ConfirmDeletion,
+
+    # Supply this when resuming after the VM was already deleted.
+    [Parameter(Mandatory = $false)]
+    [string]$NetworkInterfaceName
 )
 
 $ErrorActionPreference = "Stop"
 
 try {
-    # Step 1: Require explicit confirmation.
     if ($ConfirmDeletion -ne "yes") {
         throw "Deletion cancelled. Explicit confirmation is required."
     }
 
-    # Step 2: Validate subscription ID.
     $parsedSubscriptionId = [guid]::Empty
-
     if (-not [guid]::TryParse(
         $SubscriptionId,
         [ref]$parsedSubscriptionId
@@ -36,116 +37,101 @@ try {
         throw "Invalid Azure Subscription ID."
     }
 
-    # Step 3: Verify Azure OIDC/PowerShell authentication.
     $context = Get-AzContext
-
     if (-not $context -or -not $context.Account) {
-        throw "Azure PowerShell is not authenticated. Check the OIDC login."
+        throw "Azure PowerShell is not authenticated."
     }
 
-    # Select the requested subscription.
     $subscription = Get-AzSubscription `
         -SubscriptionId $parsedSubscriptionId.ToString() `
         -ErrorAction Stop
 
-    if (-not $subscription) {
-        throw "Requested subscription is not accessible."
-    }
-
     Set-AzContext `
-        -SubscriptionId $parsedSubscriptionId.ToString() `
+        -SubscriptionId $subscription.Id `
         -ErrorAction Stop | Out-Null
 
     $context = Get-AzContext
-
     if ($context.Subscription.Id -ne $parsedSubscriptionId.ToString()) {
         throw "Active subscription does not match the requested subscription."
     }
 
-    Write-Host "Subscription validated: $($context.Subscription.Id)"
-
-    # Step 4: Validate Resource Group.
-    $resourceGroup = Get-AzResourceGroup `
+    $null = Get-AzResourceGroup `
         -Name $ResourceGroupName `
         -ErrorAction Stop
 
-    Write-Host "Resource Group validated: $($resourceGroup.ResourceGroupName)"
+    Write-Host "Subscription and Resource Group validated."
 
-    # Step 5: Find and validate the VM.
-    $vm = Get-AzVM `
-        -ResourceGroupName $ResourceGroupName `
-        -Name $VMName `
-        -ErrorAction Stop
-
-    Write-Host "VM found: $($vm.Name)"
-    Write-Host "VM resource ID: $($vm.Id)"
-    Write-Host "Location: $($vm.Location)"
-
-    # Step 6: Collect NIC IDs before deleting the VM.
-    $nicIds = @(
-        $vm.NetworkProfile.NetworkInterfaces |
-            ForEach-Object { $_.Id } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Unique
-    )
-
-    if ($nicIds.Count -eq 0) {
-        Write-Host "No NICs are attached to this VM."
-    }
-
-    # Validate every NIC before making any deletion changes.
     $validatedNics = @()
+    $vm = $null
 
-    foreach ($nicId in $nicIds) {
-        $nic = Get-AzNetworkInterface `
-            -ResourceId $nicId `
-            -ErrorAction Stop
-
-        Write-Host "NIC found: $($nic.Name)"
-        Write-Host "NIC resource ID: $($nic.Id)"
-
-        # Only proceed with NICs attached to the selected VM.
-        if (-not $nic.VirtualMachine -or
-            $nic.VirtualMachine.Id -ine $vm.Id) {
-            throw "NIC '$($nic.Name)' is not confirmed as attached to the target VM. No resources have been deleted."
-        }
-
-        $validatedNics += $nic
-    }
-
-    Write-Host "All target NICs validated."
-    Write-Host "Deleting VM resource: $VMName"
-
-    # Step 7: Delete the VM only.
-    Remove-AzVM `
-        -ResourceGroupName $ResourceGroupName `
-        -Name $VMName `
-        -Force `
-        -ErrorAction Stop
-
-    # Step 8: Verify VM deletion before proceeding.
-    $remainingVM = Get-AzVM `
+    # Look for the VM. A missing VM is allowed only for recovery.
+    $vm = Get-AzVM `
         -ResourceGroupName $ResourceGroupName `
         -Name $VMName `
         -ErrorAction SilentlyContinue
 
-    if ($null -ne $remainingVM) {
-        throw "VM '$VMName' still exists. NIC deletion has been stopped."
-    }
+    if ($vm) {
+        Write-Host "VM found: $($vm.Name)"
 
-    Write-Host "SUCCESS: VM deletion verified."
+        # Collect NICs before deleting the VM.
+        foreach ($nicRef in $vm.NetworkProfile.NetworkInterfaces) {
+            $nic = Get-AzNetworkInterface `
+                -Name (($nicRef.Id -split "/")[-1]) `
+                -ResourceGroupName $ResourceGroupName `
+                -ErrorAction Stop
 
-    # Step 9: Delete only NICs that are now detached.
-    foreach ($originalNic in $validatedNics) {
-        $nicId = $originalNic.Id
+            if (-not $nic.VirtualMachine -or
+                $nic.VirtualMachine.Id -ine $vm.Id) {
+                throw "NIC '$($nic.Name)' is not confirmed as attached to the target VM."
+            }
 
-        # Refresh NIC state after VM deletion.
-        $currentNic = Get-AzNetworkInterface `
-            -ResourceId $nicId `
+            $validatedNics += $nic
+        }
+
+        Write-Host "Deleting VM: $VMName"
+
+        Remove-AzVM `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $VMName `
+            -Force `
+            -ErrorAction Stop
+
+        $remainingVM = Get-AzVM `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $VMName `
             -ErrorAction SilentlyContinue
 
-        if ($null -eq $currentNic) {
-            Write-Host "NIC already absent: $nicId"
+        if ($remainingVM) {
+            throw "VM deletion could not be verified."
+        }
+
+        Write-Host "SUCCESS: VM deletion verified."
+    }
+    else {
+        Write-Host "VM '$VMName' is already absent."
+
+        if ([string]::IsNullOrWhiteSpace($NetworkInterfaceName)) {
+            throw "VM is already absent. To resume NIC cleanup, provide NetworkInterfaceName."
+        }
+
+        # Recovery mode: use the explicitly supplied NIC name.
+        $nic = Get-AzNetworkInterface `
+            -Name $NetworkInterfaceName `
+            -ResourceGroupName $ResourceGroupName `
+            -ErrorAction Stop
+
+        $validatedNics += $nic
+    }
+
+    # Delete only NICs confirmed to be detached.
+    foreach ($originalNic in $validatedNics) {
+        $currentNic = Get-AzNetworkInterface `
+            -Name $originalNic.Name `
+            -ResourceGroupName $originalNic.ResourceGroupName `
+            -ErrorAction SilentlyContinue
+
+        if (-not $currentNic) {
+            Write-Host "NIC already absent: $($originalNic.Name)"
             continue
         }
 
@@ -157,26 +143,24 @@ try {
         Write-Host "Deleting detached NIC: $($currentNic.Name)"
 
         Remove-AzNetworkInterface `
-            -ResourceId $nicId `
+            -Name $currentNic.Name `
+            -ResourceGroupName $currentNic.ResourceGroupName `
             -Force `
             -ErrorAction Stop
 
-        # Verify NIC deletion.
         $remainingNic = Get-AzNetworkInterface `
-            -ResourceId $nicId `
+            -Name $currentNic.Name `
+            -ResourceGroupName $currentNic.ResourceGroupName `
             -ErrorAction SilentlyContinue
 
-        if ($null -ne $remainingNic) {
-            throw "NIC '$($currentNic.Name)' still exists. Investigate deletion status."
+        if ($remainingNic) {
+            throw "NIC '$($currentNic.Name)' still exists."
         }
 
-        Write-Host "SUCCESS: NIC deletion verified: $($currentNic.Name)"
+        Write-Host "SUCCESS: NIC deletion verified: $($originalNic.Name)"
     }
 
-    Write-Host "Decommission operation completed."
-    Write-Host "VM: $VMName"
-    Write-Host "Resource Group: $ResourceGroupName"
-    Write-Host "Subscription: $($context.Subscription.Id)"
+    Write-Host "SUCCESS: Decommission operation completed."
 }
 catch {
     Write-Error "VM decommission failed: $($_.Exception.Message)"
