@@ -4,6 +4,11 @@ name: Azure VM Decommission
 on:
   workflow_dispatch:
     inputs:
+      subscription_id:
+        description: "Exact Azure Subscription ID containing the VM"
+        required: true
+        type: string
+
       resource_group:
         description: "Azure Resource Group containing the VM"
         required: true
@@ -15,7 +20,7 @@ on:
         type: string
 
       confirm_delete:
-        description: "Confirm VM deletion"
+        description: "Confirm VM and attached NIC deletion"
         required: true
         type: choice
         options:
@@ -29,24 +34,70 @@ permissions:
 
 jobs:
   decommission:
-    name: Decommission Azure VM
+    name: Validate and Decommission Azure VM
     runs-on: ubuntu-latest
+
+    # Configure required reviewers in GitHub:
+    # Settings > Environments > production
+    environment: production
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate approved subscription
+        shell: bash
+        env:
+          REQUESTED_SUBSCRIPTION: ${{ inputs.subscription_id }}
+          ALLOWED_SUBSCRIPTIONS: ${{ secrets.AZURE_ALLOWED_SUBSCRIPTION_IDS }}
+        run: |
+          set -euo pipefail
+
+          requested="$(echo "$REQUESTED_SUBSCRIPTION" |
+            tr '[:upper:]' '[:lower:]' | xargs)"
+
+          if [[ ! "$requested" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::Invalid Subscription ID format."
+            exit 1
+          fi
+
+          if [[ -z "${ALLOWED_SUBSCRIPTIONS:-}" ]]; then
+            echo "::error::AZURE_ALLOWED_SUBSCRIPTION_IDS secret is missing."
+            exit 1
+          fi
+
+          approved="false"
+          IFS=',' read -ra IDS <<< "$ALLOWED_SUBSCRIPTIONS"
+
+          for id in "${IDS[@]}"; do
+            id="$(echo "$id" |
+              tr '[:upper:]' '[:lower:]' | xargs)"
+
+            if [[ "$requested" == "$id" ]]; then
+              approved="true"
+              break
+            fi
+          done
+
+          if [[ "$approved" != "true" ]]; then
+            echo "::error::Subscription ID is not in the approved allowlist."
+            exit 1
+          fi
+
+          echo "Subscription ID allowlist validation passed."
 
       - name: Azure login using OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          subscription-id: ${{ inputs.subscription_id }}
           enable-AzPSSession: true
 
-      - name: Validate Azure VM
+      - name: Verify subscription and delete VM plus NICs
         uses: azure/powershell@v2
         env:
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
           VM_NAME: ${{ inputs.vm_name }}
           CONFIRM_DELETION: ${{ inputs.confirm_delete }}
@@ -54,79 +105,20 @@ jobs:
           azPSVersion: latest
           errorActionPreference: Stop
           inlineScript: |
-            if ($env:CONFIRM_DELETION -ne "yes") {
-              throw "Deletion cancelled. Set confirm_delete to yes."
-            }
-
-            $context = Get-AzContext
-            if (-not $context -or -not $context.Subscription) {
-              throw "Azure PowerShell is not authenticated."
-            }
-
-            $vm = Get-AzVM `
-              -ResourceGroupName $env:RESOURCE_GROUP `
-              -Name $env:VM_NAME `
-              -ErrorAction Stop
-
-            Write-Host "VM found: $($vm.Name)"
-            Write-Host "Resource Group: $($vm.ResourceGroupName)"
-            Write-Host "Location: $($vm.Location)"
-
-      - name: Delete Azure VM using PowerShell script
-        uses: azure/powershell@v2
-        env:
-          RESOURCE_GROUP: ${{ inputs.resource_group }}
-          VM_NAME: ${{ inputs.vm_name }}
-          CONFIRM_DELETION: ${{ inputs.confirm_delete }}
-        with:
-          azPSVersion: latest
-          errorActionPreference: Stop
-          inlineScript: |
-            if ($env:CONFIRM_DELETION -ne "yes") {
-              throw "Deletion cancelled. Set confirm_delete to yes."
-            }
-
             $scriptPath = Join-Path $PWD "MyTerraformRepro/scripts/Delete-AzureVM.ps1"
 
-            if (-not (Test-Path $scriptPath -PathType Leaf)) {
-              Write-Host "Current workspace: $PWD"
-              Get-ChildItem -Path $PWD -Filter "Delete-AzureVM.ps1" -Recurse |
-                Select-Object -ExpandProperty FullName
+            Write-Host "Workspace: $PWD"
+            Write-Host "Script path: $scriptPath"
 
-              throw "Deletion script not found: $scriptPath"
+            if (-not (Test-Path $scriptPath -PathType Leaf)) {
+              throw "PowerShell script not found: $scriptPath"
             }
 
-            Write-Host "Found script: $scriptPath"
-
             & $scriptPath `
+              -SubscriptionId $env:SUBSCRIPTION_ID `
               -ResourceGroupName $env:RESOURCE_GROUP `
               -VMName $env:VM_NAME `
               -ConfirmDeletion $env:CONFIRM_DELETION
-
-      - name: Verify VM deletion
-        uses: azure/powershell@v2
-        env:
-          RESOURCE_GROUP: ${{ inputs.resource_group }}
-          VM_NAME: ${{ inputs.vm_name }}
-          CONFIRM_DELETION: ${{ inputs.confirm_delete }}
-        with:
-          azPSVersion: latest
-          errorActionPreference: Stop
-          inlineScript: |
-            if ($env:CONFIRM_DELETION -ne "yes") {
-              throw "Deletion was not confirmed."
-            }
-
-            $remainingVM = Get-AzVM `
-              -ResourceGroupName $env:RESOURCE_GROUP `
-              -Name $env:VM_NAME `
-              -ErrorAction SilentlyContinue
-
-            if ($null -ne $remainingVM) {
-              throw "VM still exists. Please investigate deletion status."
-            }
-
-            Write-Host "SUCCESS: VM resource deletion verified."
 
       - name: Azure logout
         if: always()
