@@ -1,32 +1,31 @@
-
+```yaml
 name: Azure VM Decommission
 
 on:
   workflow_dispatch:
     inputs:
       subscription_id:
-        description: "Exact Azure Subscription ID containing the VM"
+        description: "Azure Subscription ID"
         required: true
         type: string
 
       resource_group:
-        description: "Azure Resource Group containing the VM"
+        description: "Azure Resource Group"
         required: true
         type: string
 
       vm_name:
-        description: "Exact Azure VM name to delete"
+        description: "Azure VM Name"
         required: true
         type: string
 
       confirm_delete:
-        description: "Confirm VM and attached NIC deletion"
+        description: "Confirm VM deletion"
         required: true
         type: choice
         options:
           - "no"
           - "yes"
-        default: "no"
 
 permissions:
   contents: read
@@ -34,18 +33,15 @@ permissions:
 
 jobs:
   decommission:
-    name: Validate and Decommission Azure VM
+    name: Decommission Azure VM
     runs-on: ubuntu-latest
-
-    # Configure required reviewers in GitHub:
-    # Settings > Environments > production
     environment: production
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Validate approved subscription
+      - name: Validate Subscription Allowlist
         shell: bash
         env:
           REQUESTED_SUBSCRIPTION: ${{ inputs.subscription_id }}
@@ -53,40 +49,36 @@ jobs:
         run: |
           set -euo pipefail
 
-          requested="$(echo "$REQUESTED_SUBSCRIPTION" |
-            tr '[:upper:]' '[:lower:]' | xargs)"
-
-          if [[ ! "$requested" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-            echo "::error::Invalid Subscription ID format."
+          if [[ -z "$ALLOWED_SUBSCRIPTIONS" ]]; then
+            echo "AZURE_ALLOWED_SUBSCRIPTION_IDS secret is missing."
             exit 1
           fi
 
-          if [[ -z "${ALLOWED_SUBSCRIPTIONS:-}" ]]; then
-            echo "::error::AZURE_ALLOWED_SUBSCRIPTION_IDS secret is missing."
+          if [[ ! "$REQUESTED_SUBSCRIPTION" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "Invalid subscription ID format."
             exit 1
           fi
 
-          approved="false"
-          IFS=',' read -ra IDS <<< "$ALLOWED_SUBSCRIPTIONS"
+          ALLOWED=false
+          IFS=',' read -ra SUBS <<< "$ALLOWED_SUBSCRIPTIONS"
 
-          for id in "${IDS[@]}"; do
-            id="$(echo "$id" |
-              tr '[:upper:]' '[:lower:]' | xargs)"
-
-            if [[ "$requested" == "$id" ]]; then
-              approved="true"
+          for SUB in "${SUBS[@]}"; do
+            SUB="$(echo "$SUB" | xargs)"
+            if [[ "${SUB,,}" == "${REQUESTED_SUBSCRIPTION,,}" ]]; then
+              ALLOWED=true
               break
             fi
           done
 
-          if [[ "$approved" != "true" ]]; then
-            echo "::error::Subscription ID is not in the approved allowlist."
+          if [[ "$ALLOWED" != "true" ]]; then
+            echo "Subscription is not in the approved allowlist."
             exit 1
           fi
 
-          echo "Subscription ID allowlist validation passed."
+          echo "Subscription allowlist validation passed."
 
-      - name: Azure login using OIDC
+      # Keep OIDC authentication
+      - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -94,33 +86,28 @@ jobs:
           subscription-id: ${{ inputs.subscription_id }}
           enable-AzPSSession: true
 
-      - name: Verify subscription and delete VM plus NICs
+      - name: Validate and Delete Azure VM
         uses: azure/powershell@v2
-        env:
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
-          RESOURCE_GROUP: ${{ inputs.resource_group }}
-          VM_NAME: ${{ inputs.vm_name }}
-          CONFIRM_DELETION: ${{ inputs.confirm_delete }}
         with:
           azPSVersion: latest
           errorActionPreference: Stop
           inlineScript: |
+            $ErrorActionPreference = "Stop"
+
             $scriptPath = Join-Path $PWD "MyTerraformRepro/scripts/Delete-AzureVM.ps1"
 
-            Write-Host "Workspace: $PWD"
-            Write-Host "Script path: $scriptPath"
-
-            if (-not (Test-Path $scriptPath -PathType Leaf)) {
+            if (-not (Test-Path $scriptPath)) {
               throw "PowerShell script not found: $scriptPath"
             }
 
             & $scriptPath `
-              -SubscriptionId $env:SUBSCRIPTION_ID `
-              -ResourceGroupName $env:RESOURCE_GROUP `
-              -VMName $env:VM_NAME `
-              -ConfirmDeletion $env:CONFIRM_DELETION
+              -SubscriptionId "${{ inputs.subscription_id }}" `
+              -ResourceGroupName "${{ inputs.resource_group }}" `
+              -VMName "${{ inputs.vm_name }}" `
+              -ConfirmDeletion "${{ inputs.confirm_delete }}"
 
-      - name: Azure logout
+      - name: Azure Logout
         if: always()
         shell: bash
         run: az logout
+```
