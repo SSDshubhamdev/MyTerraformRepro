@@ -8,14 +8,17 @@ on:
         description: Azure Subscription ID
         required: true
         type: string
+
       resource_group:
         description: Resource Group Name
         required: true
         type: string
+
       vm_name:
         description: Virtual Machine Name
         required: true
         type: string
+
       environment:
         description: Environment
         required: true
@@ -23,6 +26,7 @@ on:
         options:
           - Dev
           - Prod
+
       requester:
         description: Request Raised By
         required: true
@@ -41,7 +45,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Preserve existing OIDC authentication.
+      # Keep existing OIDC authentication.
       - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
@@ -57,7 +61,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking Azure CLI authentication..."
+          Write-Host "Checking Azure authentication..."
 
           az account show --query "{subscription:id,tenant:tenantId}" --output json
 
@@ -97,10 +101,7 @@ jobs:
           VM_NAME: ${{ inputs.vm_name }}
           VM_ENVIRONMENT: ${{ inputs.environment }}
           REQUESTER: ${{ inputs.requester }}
-
-          # FIX: Pass tenant ID into the PowerShell script.
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
         run: |
