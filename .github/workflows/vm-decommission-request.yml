@@ -1,0 +1,78 @@
+
+name: Azure VM Decommission - Request
+
+on:
+  workflow_dispatch:
+    inputs:
+      subscription_id:
+        description: "Azure Subscription ID"
+        required: true
+        type: string
+
+      resource_group:
+        description: "Resource Group Name"
+        required: true
+        type: string
+
+      vm_name:
+        description: "Virtual Machine Name"
+        required: true
+        type: string
+
+      environment:
+        description: "Environment"
+        required: true
+        type: choice
+        options:
+          - Dev
+          - Prod
+
+      requester:
+        description: "Request Raised By"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  submit-decommission-request:
+    name: Validate VM and Create Request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Existing OIDC authentication pattern preserved
+      - name: Azure login using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.subscription_id }}
+          enable-AzPSSession: true
+
+      - name: Validate VM and Save Request
+        shell: pwsh
+        env:
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+          VM_NAME: ${{ inputs.vm_name }}
+          VM_ENVIRONMENT: ${{ inputs.environment }}
+          REQUESTER: ${{ inputs.requester }}
+          STORAGE_ACCOUNT: shubhamstorage11
+          TABLE_NAME: VMDecommissionRequests
+          DECOMMISSION_NOTIFICATION_WEBHOOK: ${{ secrets.DECOMMISSION_NOTIFICATION_WEBHOOK }}
+        run: |
+          ./scripts/Submit-VMDecommissionRequest.ps1
+
+      - name: Upload Request Summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-decommission-request-summary
+          path: decommission-request-summary.json
+          if-no-files-found: ignore
+          retention-days: 30
