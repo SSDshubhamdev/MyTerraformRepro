@@ -8,14 +8,17 @@ on:
         description: "Azure Subscription ID"
         required: true
         type: string
+
       resource_group:
         description: "Resource Group Name"
         required: true
         type: string
+
       vm_name:
         description: "Virtual Machine Name"
         required: true
         type: string
+
       environment:
         description: "Environment"
         required: true
@@ -23,6 +26,7 @@ on:
         options:
           - Dev
           - Prod
+
       requester:
         description: "Request Raised By"
         required: true
@@ -34,12 +38,19 @@ permissions:
 
 jobs:
   submit-decommission-request:
+    name: Validate VM and Create Request
     runs-on: ubuntu-latest
 
     steps:
+      # ---------------------------------------------
+      # 1. Checkout repository
+      # ---------------------------------------------
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # ---------------------------------------------
+      # 2. Existing Azure OIDC login
+      # ---------------------------------------------
       - name: Azure login using OIDC
         uses: azure/login@v2
         with:
@@ -48,7 +59,10 @@ jobs:
           subscription-id: ${{ inputs.subscription_id }}
           enable-AzPSSession: true
 
-      - name: Verify Azure Subscription Context
+      # ---------------------------------------------
+      # 3. Verify Azure PowerShell context
+      # ---------------------------------------------
+      - name: Verify Azure Subscription
         uses: azure/powershell@v2
         with:
           azPSVersion: latest
@@ -62,7 +76,7 @@ jobs:
 
             if ($null -eq $context -or
                 $null -eq $context.Account) {
-              throw "Azure PowerShell is not authenticated. Check OIDC login."
+              throw "Azure PowerShell authentication is missing. Check OIDC login."
             }
 
             $subscription = Get-AzSubscription `
@@ -71,7 +85,7 @@ jobs:
               -ErrorAction Stop
 
             if ($null -eq $subscription) {
-              throw "Subscription not found or not accessible to this identity."
+              throw "Subscription is unavailable to the logged-in identity."
             }
 
             Set-AzContext `
@@ -80,15 +94,24 @@ jobs:
 
             $verifiedContext = Get-AzContext
 
-            Write-Host "Authenticated Azure account successfully."
-            Write-Host "Subscription ID: $($verifiedContext.Subscription.Id)"
-            Write-Host "Tenant ID: $($verifiedContext.Tenant.Id)"
+            if ($verifiedContext.Subscription.Id -ne $subscriptionId) {
+              throw "Azure subscription context verification failed."
+            }
 
+            Write-Host "Azure subscription context verified."
+            Write-Host "Subscription ID: $($verifiedContext.Subscription.Id)"
+
+      # ---------------------------------------------
+      # 4. Validate VM, inventory dependencies,
+      #    and save the decommission request
+      # ---------------------------------------------
       - name: Validate VM and Save Request
         uses: azure/powershell@v2
         with:
           azPSVersion: latest
-          inlineScript: ./scripts/Submit-VMDecommissionRequest.ps1
+          inlineScript: |
+            $ErrorActionPreference = "Stop"
+            ./scripts/Submit-VMDecommissionRequest.ps1
         env:
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
@@ -100,6 +123,9 @@ jobs:
           TABLE_NAME: VMDecommissionRequests
           DECOMMISSION_NOTIFICATION_WEBHOOK: ${{ secrets.DECOMMISSION_NOTIFICATION_WEBHOOK }}
 
+      # ---------------------------------------------
+      # 5. Upload request summary for troubleshooting
+      # ---------------------------------------------
       - name: Upload Request Summary
         if: always()
         uses: actions/upload-artifact@v4
