@@ -42,8 +42,9 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
 
-      - name: Run PowerShell decommission script
+      - name: Validate and delete Azure VM
         uses: azure/powershell@v2
         env:
           RESOURCE_GROUP: ${{ inputs.resource_group }}
@@ -53,6 +54,10 @@ jobs:
           azPSVersion: latest
           errorActionPreference: Stop
           inlineScript: |
+            if ($env:CONFIRM_DELETION -ne "yes") {
+              throw "Deletion cancelled. Set confirm_delete to yes to proceed."
+            }
+
             . ./scripts/Delete-AzureVM.ps1 `
               -ResourceGroupName $env:RESOURCE_GROUP `
               -VMName $env:VM_NAME `
