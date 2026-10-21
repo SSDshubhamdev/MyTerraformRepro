@@ -123,6 +123,24 @@ jobs:
         run: |
           ./scripts/Submit-VMDecommissionRequest.ps1
 
+      
+      - name: Send Gmail Notification
+        id: send-email
+        continue-on-error: true
+        shell: pwsh
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          REQUESTER_EMAIL: ${{ inputs.requester_email }}
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+          VM_NAME: ${{ inputs.vm_name }}
+          VM_ENVIRONMENT: ${{ inputs.environment }}
+          REQUEST_ID: ${{ steps.submit.outputs.request_id }}
+        run: |
+          ./scripts/Send-VMDecommissionEmail.ps1
+
+
       - name: Upload Request Summary
         if: always()
         uses: actions/upload-artifact@v4
