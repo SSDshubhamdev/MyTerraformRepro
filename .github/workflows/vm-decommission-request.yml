@@ -8,14 +8,17 @@ on:
         description: Azure Subscription ID
         required: true
         type: string
+
       resource_group:
         description: Resource Group Name
         required: true
         type: string
+
       vm_name:
         description: Virtual Machine Name
         required: true
         type: string
+
       environment:
         description: Environment
         required: true
@@ -23,8 +26,14 @@ on:
         options:
           - Dev
           - Prod
+
       requester:
         description: Request Raised By
+        required: true
+        type: string
+
+      requester_email:
+        description: Requester Email Address
         required: true
         type: string
 
@@ -48,7 +57,24 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ inputs.subscription_id }}
 
-      - name: Verify Azure and Storage Table
+      - name: Verify Azure Login
+        shell: pwsh
+        env:
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          az account set --subscription "$env:SUBSCRIPTION_ID"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to select Azure subscription."
+          }
+
+          az account show --query "{subscription:id,tenant:tenantId}" --output json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Azure login verification failed."
+          }
+
+      - name: Check or Create Storage Table
         shell: pwsh
         env:
           STORAGE_ACCOUNT: shubhamstorage11
@@ -56,34 +82,22 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking Azure CLI login..."
-
-          az account show --query "{subscription:id,tenant:tenantId}" --output json
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Azure CLI login verification failed."
-          }
-
-          Write-Host "Checking Storage Table..."
-
-          $tableOutput = az storage table exists `
-            --account-name $env:STORAGE_ACCOUNT `
-            --name $env:TABLE_NAME `
+          $result = az storage table exists `
+            --account-name "$env:STORAGE_ACCOUNT" `
+            --name "$env:TABLE_NAME" `
             --auth-mode login `
             --output json
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Storage Table existence check failed."
+            throw "Storage Table check failed. Verify Azure Storage permissions."
           }
 
-          $tableResult = ($tableOutput | Out-String) | ConvertFrom-Json
+          $tableInfo = ($result -join "`n") | ConvertFrom-Json
 
-          if (-not $tableResult.exists) {
-            Write-Host "Table does not exist. Creating it..."
-
+          if (-not $tableInfo.exists) {
             az storage table create `
-              --account-name $env:STORAGE_ACCOUNT `
-              --name $env:TABLE_NAME `
+              --account-name "$env:STORAGE_ACCOUNT" `
+              --name "$env:TABLE_NAME" `
               --auth-mode login `
               --output json
 
@@ -91,11 +105,11 @@ jobs:
               throw "Storage Table creation failed."
             }
           }
-          else {
-            Write-Host "Storage Table already exists."
-          }
 
-      - name: Validate VM and Insert Request
+          Write-Host "Storage Table is ready."
+
+      - name: Validate VM and Save Request
+        id: submit
         shell: pwsh
         env:
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
@@ -103,7 +117,7 @@ jobs:
           VM_NAME: ${{ inputs.vm_name }}
           VM_ENVIRONMENT: ${{ inputs.environment }}
           REQUESTER: ${{ inputs.requester }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          REQUESTER_EMAIL: ${{ inputs.requester_email }}
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
         run: |
