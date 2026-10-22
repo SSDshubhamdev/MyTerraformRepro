@@ -1,5 +1,5 @@
 
-name: Azure VM Stop Request
+name: Azure VM Decommission Request
 
 on:
   workflow_dispatch:
@@ -42,8 +42,8 @@ permissions:
   contents: read
 
 jobs:
-  stop-vm:
-    name: Validate and Stop Azure VM
+  submit-request:
+    name: Submit VM Decommission Request
     runs-on: ubuntu-latest
 
     steps:
@@ -57,18 +57,31 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ inputs.subscription_id }}
 
-      - name: Verify Azure Login
+      - name: Verify Azure Subscription
         shell: pwsh
+        env:
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          az account show --output table
-
+          $accountJson = az account show --output json 2>&1
           if ($LASTEXITCODE -ne 0) {
-            throw "Azure login verification failed."
+            throw "Azure login failed: $($accountJson -join "`n")"
           }
 
-      - name: Ensure Azure Storage Table Exists
+          az account set --subscription "$env:SUBSCRIPTION_ID"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not select subscription $env:SUBSCRIPTION_ID"
+          }
+
+          $account = az account show --output json | ConvertFrom-Json
+          if ($account.id -ne $env:SUBSCRIPTION_ID) {
+            throw "Active Azure subscription does not match the requested subscription."
+          }
+
+          Write-Host "Azure subscription verified."
+
+      - name: Ensure Storage Table Exists
         shell: pwsh
         env:
           STORAGE_ACCOUNT: shubhamstorage11
@@ -77,34 +90,36 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           az storage table create `
-            --account-name $env:STORAGE_ACCOUNT `
-            --name $env:TABLE_NAME `
+            --account-name "$env:STORAGE_ACCOUNT" `
+            --name "$env:TABLE_NAME" `
             --auth-mode login `
             --only-show-errors `
             --output none
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not create or access the Azure Storage Table."
+            throw "Could not create or access Azure Storage Table."
           }
 
-      - name: Submit Request and Stop VM
+          Write-Host "Storage table is ready."
+
+      - name: Submit Decommission Request
+        id: submit_request
         shell: pwsh
         env:
-          AZURE_SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
           VM_NAME: ${{ inputs.vm_name }}
-          ENVIRONMENT: ${{ inputs.environment }}
+          VM_ENVIRONMENT: ${{ inputs.environment }}
           REQUESTER: ${{ inputs.requester }}
           REQUESTER_EMAIL: ${{ inputs.requester_email }}
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
         run: |
           $ErrorActionPreference = "Stop"
-
           ./scripts/Submit-VMDecommissionRequest.ps1
 
       - name: Send Email Notification
-        if: always()
+        if: success()
         continue-on-error: true
         shell: pwsh
         env:
@@ -112,27 +127,20 @@ jobs:
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
           REQUESTER: ${{ inputs.requester }}
           REQUESTER_EMAIL: ${{ inputs.requester_email }}
-          VM_NAME: ${{ inputs.vm_name }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
-          ENVIRONMENT: ${{ inputs.environment }}
+          VM_NAME: ${{ inputs.vm_name }}
+          VM_ENVIRONMENT: ${{ inputs.environment }}
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          REQUEST_ID: ${{ steps.submit_request.outputs.request_id }}
           JOB_STATUS: ${{ job.status }}
         run: |
           $ErrorActionPreference = "Stop"
-
-          if (Test-Path "./scripts/Send-VMDecommissionEmail.ps1") {
-            ./scripts/Send-VMDecommissionEmail.ps1
-          }
-          else {
-            Write-Warning "Email script not found. Skipping email notification."
-          }
+          ./scripts/Send-VMDecommissionEmail.ps1
 
       - name: Upload Request Summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vm-stop-request-summary
-          path: |
-            vm-stop-request-summary.json
-            vm-stop-request-summary.txt
+          name: decommission-request-summary
+          path: decommission-request-summary.json
           if-no-files-found: warn
