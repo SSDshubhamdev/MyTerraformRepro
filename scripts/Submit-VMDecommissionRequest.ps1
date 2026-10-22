@@ -3,8 +3,14 @@ $ErrorActionPreference = "Stop"
 
 # ============================================================
 # Azure VM Decommission Request - Pipeline 1
-# This script records a request only.
-# It does NOT stop or delete the VM.
+# 1. Validate inputs and Azure identity
+# 2. Validate selected VM
+# 3. Save request in Azure Table
+# 4. Immediately deallocate the VM
+# 5. Verify PowerState/deallocated
+# 6. Update Azure Table status
+#
+# IMPORTANT: VM is NOT deleted.
 # ============================================================
 
 # STEP 1: Validate required environment variables
@@ -24,7 +30,7 @@ foreach ($variable in $requiredVariables) {
     $value = [Environment]::GetEnvironmentVariable($variable)
 
     if ([string]::IsNullOrWhiteSpace($value)) {
-        throw "Required environment variable is missing: $variable. Check the workflow env mapping."
+        throw "Required environment variable is missing: $variable. Check workflow env mapping."
     }
 }
 
@@ -60,7 +66,7 @@ Write-Host "Resource Group: $resourceGroup"
 Write-Host "VM Name       : $vmName"
 Write-Host "Environment   : $environment"
 Write-Host "Requester     : $requester"
-Write-Host "Waiting Period: $waitingPeriodDays days"
+Write-Host "Action        : Immediate Deallocation"
 Write-Host "============================================"
 
 # STEP 3: Verify Azure login
@@ -82,7 +88,7 @@ if ($LASTEXITCODE -ne 0) {
 $accountJson = az account show --output json 2>&1
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Unable to retrieve the active Azure subscription."
+    throw "Unable to retrieve active Azure subscription."
 }
 
 $account = ($accountJson -join "`n") | ConvertFrom-Json
@@ -104,7 +110,7 @@ $vmJson = az vm show `
     --output json 2>&1
 
 if ($LASTEXITCODE -ne 0) {
-    throw "VM validation failed. Check the subscription, resource group, VM name, and Azure permissions. Details: $($vmJson -join "`n")"
+    throw "VM validation failed: $($vmJson -join "`n")"
 }
 
 $vm = ($vmJson -join "`n") | ConvertFrom-Json
@@ -130,29 +136,42 @@ if ($vm.networkProfile -and $vm.networkProfile.networkInterfaces) {
 
 $osDiskId = ""
 
-if ($vm.storageProfile -and $vm.storageProfile.osDisk) {
-    if ($vm.storageProfile.osDisk.managedDisk) {
-        $osDiskId = [string]$vm.storageProfile.osDisk.managedDisk.id
-    }
+if ($vm.storageProfile -and $vm.storageProfile.osDisk -and
+    $vm.storageProfile.osDisk.managedDisk) {
+    $osDiskId = [string]$vm.storageProfile.osDisk.managedDisk.id
 }
 
-# STEP 7: Generate request ID
+# STEP 7: Generate request ID and publish output early
 
 $requestId = [guid]::NewGuid().ToString()
 $partitionKey = "DECOMMISSION_REQUEST"
 $rowKey = $requestId
 $requestedAtUtc = [DateTime]::UtcNow.ToString("o")
+$workspace = $env:GITHUB_WORKSPACE
+
+if ([string]::IsNullOrWhiteSpace($workspace)) {
+    $workspace = (Get-Location).Path
+}
+
+$summaryPath = Join-Path $workspace "decommission-request-summary.json"
+
+if ([string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) {
+    throw "GITHUB_OUTPUT is missing. Run this script inside GitHub Actions."
+}
+
+"request_id=$requestId" |
+    Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
 Write-Host "Request ID: $requestId"
 
-# STEP 8: Insert request into Azure Storage Table
+# STEP 8: Save request to Azure Storage Table BEFORE deallocation
 
 $entityArguments = @(
     "PartitionKey=$partitionKey"
     "RowKey=$rowKey"
     "RequestId=$requestId"
-    "RequestStatus=PendingApproval"
-    "RequestedAction=Decommission"
+    "RequestStatus=StopInProgress"
+    "RequestedAction=Deallocate"
     "SubscriptionId=$subscriptionId"
     "ResourceGroup=$resourceGroup"
     "VmName=$vmName"
@@ -180,90 +199,248 @@ $insertResult = az storage entity insert `
     --output json 2>&1
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Azure Storage Table insert failed. Verify that the table exists and the identity has Storage Table data permissions. Details: $($insertResult -join "`n")"
+    throw "Azure Table insert failed. Check table existence and Storage Table data permissions. Details: $($insertResult -join "`n")"
 }
 
 Write-Host "Request saved successfully."
 
-# STEP 9: Create JSON summary
+# Track the real execution result for failure handling.
+$vmDeallocated = $false
+$finalPowerState = "Unknown"
+$operationError = $null
 
-$summary = [ordered]@{
-    requestId         = $requestId
-    requestStatus     = "PendingApproval"
-    requestedAction   = "Decommission"
-    subscriptionId    = $subscriptionId
-    resourceGroup     = $resourceGroup
-    vmName            = $vm.name
-    vmId              = $vm.id
-    environment       = $environment
-    requester         = $requester
-    requesterEmail    = $requesterEmail
-    location          = $vm.location
-    osDiskId          = $osDiskId
-    nicIds            = $nicIds
-    requestedAtUtc    = $requestedAtUtc
-    waitingPeriodDays = $waitingPeriodDays
-    vmStopped         = $false
-    vmDeleted         = $false
-}
+try {
+    # STEP 9: Check current power state
 
-$workspace = $env:GITHUB_WORKSPACE
+    Write-Host "Checking current VM power state..."
 
-if ([string]::IsNullOrWhiteSpace($workspace)) {
-    $workspace = (Get-Location).Path
-}
+    $instanceViewJson = az vm get-instance-view `
+        --subscription "$subscriptionId" `
+        --resource-group "$resourceGroup" `
+        --name "$vmName" `
+        --output json 2>&1
 
-$summaryPath = Join-Path $workspace "decommission-request-summary.json"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not read VM instance view: $($instanceViewJson -join "`n")"
+    }
 
-$summary |
-    ConvertTo-Json -Depth 10 |
-    Set-Content -LiteralPath $summaryPath -Encoding utf8
+    $instanceView = ($instanceViewJson -join "`n") | ConvertFrom-Json
+    $currentPowerState = $null
 
-Write-Host "Summary created: $summaryPath"
+    foreach ($status in $instanceView.statuses) {
+        if ($status.code -like "PowerState/*") {
+            $currentPowerState = $status.code
+            break
+        }
+    }
 
-# STEP 10: Publish request ID to GitHub Actions
+    # STEP 10: Deallocate VM if it is not already deallocated
 
-if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) {
-    "request_id=$requestId" |
-        Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+    if ($currentPowerState -eq "PowerState/deallocated") {
+        Write-Host "VM is already deallocated."
+    }
+    else {
+        Write-Host "Deallocating VM '$vmName'..."
 
-    Write-Host "Request ID published to GitHub Actions."
-}
-else {
-    throw "GITHUB_OUTPUT is missing. This script must run inside GitHub Actions."
-}
+        az vm deallocate `
+            --subscription "$subscriptionId" `
+            --resource-group "$resourceGroup" `
+            --name "$vmName" `
+            --only-show-errors `
+            --output none
 
-# STEP 11: Add GitHub Actions run summary
+        if ($LASTEXITCODE -ne 0) {
+            throw "Azure VM deallocation command failed."
+        }
+    }
 
-if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
-    @"
+    # STEP 11: Poll and verify final power state
+
+    $maxAttempts = 18
+    $finalPowerState = $null
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Write-Host "Verifying power state: attempt $attempt of $maxAttempts"
+
+        $verifyJson = az vm get-instance-view `
+            --subscription "$subscriptionId" `
+            --resource-group "$resourceGroup" `
+            --name "$vmName" `
+            --output json 2>&1
+
+        if ($LASTEXITCODE -eq 0) {
+            $verify = ($verifyJson -join "`n") | ConvertFrom-Json
+
+            foreach ($status in $verify.statuses) {
+                if ($status.code -like "PowerState/*") {
+                    $finalPowerState = $status.code
+                    break
+                }
+            }
+
+            if ($finalPowerState -eq "PowerState/deallocated") {
+                break
+            }
+        }
+
+        if ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 10
+        }
+    }
+
+    if ($finalPowerState -ne "PowerState/deallocated") {
+        throw "VM deallocation could not be confirmed. Last state: $finalPowerState"
+    }
+
+    $vmDeallocated = $true
+
+    Write-Host "VM state verified: $finalPowerState"
+
+    # STEP 12: Update request status in Azure Table
+
+    $completedAtUtc = [DateTime]::UtcNow.ToString("o")
+
+    $updateArguments = @(
+        "PartitionKey=$partitionKey"
+        "RowKey=$rowKey"
+        "RequestStatus=Stopped"
+        "VmStopped=true"
+        "VmDeleted=false"
+        "FinalPowerState=$finalPowerState"
+        "CompletedAtUtc=$completedAtUtc"
+    )
+
+    az storage entity merge `
+        --account-name "$storageAccount" `
+        --table-name "$tableName" `
+        --auth-mode login `
+        --entity $updateArguments `
+        --only-show-errors `
+        --output none
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "VM is deallocated, but updating the Azure Table status failed."
+    }
+
+    # STEP 13: Create success summary
+
+    $summary = [ordered]@{
+        requestId         = $requestId
+        requestStatus     = "Stopped"
+        requestedAction   = "Deallocate"
+        subscriptionId    = $subscriptionId
+        resourceGroup     = $resourceGroup
+        vmName            = $vm.name
+        vmId              = $vm.id
+        environment       = $environment
+        requester         = $requester
+        requesterEmail    = $requesterEmail
+        location          = $vm.location
+        osDiskId          = $osDiskId
+        nicIds            = $nicIds
+        requestedAtUtc    = $requestedAtUtc
+        completedAtUtc    = $completedAtUtc
+        finalPowerState   = $finalPowerState
+        vmStopped         = $true
+        vmDeleted         = $false
+    }
+
+    $summary |
+        ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $summaryPath -Encoding utf8
+
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
+        @"
 ## Azure VM Decommission Request
 
 | Field | Value |
 |---|---|
 | Request ID | $requestId |
-| Status | PendingApproval |
+| Status | Stopped |
 | Subscription ID | $subscriptionId |
 | Resource Group | $resourceGroup |
 | VM Name | $($vm.name) |
 | Environment | $environment |
-| Requester | $requester |
-| Requested At UTC | $requestedAtUtc |
-| Waiting Period | $waitingPeriodDays days |
-| VM Stopped | No |
+| Final Power State | $finalPowerState |
+| VM Stopped | Yes |
 | VM Deleted | No |
-
-This pipeline records the request only. It does not stop or delete Azure resources.
 "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+    }
+
+    Write-Host "============================================"
+    Write-Host "SUCCESS: VM DEALLOCATION VERIFIED"
+    Write-Host "Request ID : $requestId"
+    Write-Host "Status     : Stopped"
+    Write-Host "VM stopped : Yes"
+    Write-Host "VM deleted : No"
+    Write-Host "============================================"
 }
+catch {
+    $operationError = $_.Exception.Message
+    $failedAtUtc = [DateTime]::UtcNow.ToString("o")
 
-# STEP 12: Final result
+    # If the VM stopped but the Table update failed, do not claim
+    # that the VM stop itself failed.
+    if ($vmDeallocated) {
+        $failureStatus = "StoppedTableUpdateFailed"
+        $stoppedValue = "true"
+    }
+    else {
+        $failureStatus = "StopFailed"
+        $stoppedValue = "false"
+    }
 
-Write-Host "============================================"
-Write-Host "REQUEST SUBMITTED SUCCESSFULLY"
-Write-Host "============================================"
-Write-Host "Request ID : $requestId"
-Write-Host "Status     : PendingApproval"
-Write-Host "VM stopped : No"
-Write-Host "VM deleted : No"
-Write-Host "============================================"
+    $failureArguments = @(
+        "PartitionKey=$partitionKey"
+        "RowKey=$rowKey"
+        "RequestStatus=$failureStatus"
+        "VmStopped=$stoppedValue"
+        "VmDeleted=false"
+        "FailureReason=$(($operationError -replace '[\r\n]+', ' '))"
+        "FailedAtUtc=$failedAtUtc"
+    )
+
+    az storage entity merge `
+        --account-name "$storageAccount" `
+        --table-name "$tableName" `
+        --auth-mode login `
+        --entity $failureArguments `
+        --only-show-errors `
+        --output none
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Unable to save failure status to Azure Table."
+    }
+
+    $failureSummary = [ordered]@{
+        requestId      = $requestId
+        requestStatus  = $failureStatus
+        subscriptionId = $subscriptionId
+        resourceGroup  = $resourceGroup
+        vmName         = $vmName
+        environment    = $environment
+        vmStopped      = $vmDeallocated
+        vmDeleted      = $false
+        failureReason  = $operationError
+        failedAtUtc    = $failedAtUtc
+    }
+
+    $failureSummary |
+        ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $summaryPath -Encoding utf8
+
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
+        @"
+## Azure VM Deallocation Operation Failed
+
+- **Request ID:** $requestId
+- **VM:** $vmName
+- **Request status:** $failureStatus
+- **VM deallocated:** $vmDeallocated
+- **VM deleted:** No
+- **Error:** $operationError
+"@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+    }
+
+    throw
+}
