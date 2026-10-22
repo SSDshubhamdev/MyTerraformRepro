@@ -1,26 +1,26 @@
 
-name: Azure VM Decommission Request
+name: Azure VM Stop Request
 
 on:
   workflow_dispatch:
     inputs:
       subscription_id:
-        description: Azure Subscription ID
+        description: "Azure Subscription ID"
         required: true
         type: string
 
       resource_group:
-        description: Resource Group Name
+        description: "Azure Resource Group"
         required: true
         type: string
 
       vm_name:
-        description: Virtual Machine Name
+        description: "Azure VM Name"
         required: true
         type: string
 
       environment:
-        description: Environment
+        description: "Environment"
         required: true
         type: choice
         options:
@@ -28,22 +28,22 @@ on:
           - Prod
 
       requester:
-        description: Request Raised By
+        description: "Requester Name"
         required: true
         type: string
 
       requester_email:
-        description: Requester Email Address
+        description: "Requester Email Address"
         required: true
         type: string
 
 permissions:
-  contents: read
   id-token: write
+  contents: read
 
 jobs:
-  submit-request:
-    name: Validate VM and Save Request
+  stop-vm:
+    name: Validate and Stop Azure VM
     runs-on: ubuntu-latest
 
     steps:
@@ -59,22 +59,16 @@ jobs:
 
       - name: Verify Azure Login
         shell: pwsh
-        env:
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          az account set --subscription "$env:SUBSCRIPTION_ID"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to select Azure subscription."
-          }
+          az account show --output table
 
-          az account show --query "{subscription:id,tenant:tenantId}" --output json
           if ($LASTEXITCODE -ne 0) {
             throw "Azure login verification failed."
           }
 
-      - name: Check or Create Storage Table
+      - name: Ensure Azure Storage Table Exists
         shell: pwsh
         env:
           STORAGE_ACCOUNT: shubhamstorage11
@@ -82,70 +76,63 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $result = az storage table exists `
-            --account-name "$env:STORAGE_ACCOUNT" `
-            --name "$env:TABLE_NAME" `
+          az storage table create `
+            --account-name $env:STORAGE_ACCOUNT `
+            --name $env:TABLE_NAME `
             --auth-mode login `
-            --output json
+            --only-show-errors `
+            --output none
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Storage Table check failed. Verify Azure Storage permissions."
+            throw "Could not create or access the Azure Storage Table."
           }
 
-          $tableInfo = ($result -join "`n") | ConvertFrom-Json
-
-          if (-not $tableInfo.exists) {
-            az storage table create `
-              --account-name "$env:STORAGE_ACCOUNT" `
-              --name "$env:TABLE_NAME" `
-              --auth-mode login `
-              --output json
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "Storage Table creation failed."
-            }
-          }
-
-          Write-Host "Storage Table is ready."
-
-      - name: Validate VM and Save Request
-        id: submit
+      - name: Submit Request and Stop VM
         shell: pwsh
         env:
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          AZURE_SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
           VM_NAME: ${{ inputs.vm_name }}
-          VM_ENVIRONMENT: ${{ inputs.environment }}
+          ENVIRONMENT: ${{ inputs.environment }}
           REQUESTER: ${{ inputs.requester }}
           REQUESTER_EMAIL: ${{ inputs.requester_email }}
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
         run: |
+          $ErrorActionPreference = "Stop"
+
           ./scripts/Submit-VMDecommissionRequest.ps1
 
-      
-      - name: Send Gmail Notification
-        id: send-email
+      - name: Send Email Notification
+        if: always()
         continue-on-error: true
         shell: pwsh
         env:
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          REQUESTER: ${{ inputs.requester }}
           REQUESTER_EMAIL: ${{ inputs.requester_email }}
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
-          RESOURCE_GROUP: ${{ inputs.resource_group }}
           VM_NAME: ${{ inputs.vm_name }}
-          VM_ENVIRONMENT: ${{ inputs.environment }}
-          REQUEST_ID: ${{ steps.submit.outputs.request_id }}
+          RESOURCE_GROUP: ${{ inputs.resource_group }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          ./scripts/Send-VMDecommissionEmail.ps1
+          $ErrorActionPreference = "Stop"
 
+          if (Test-Path "./scripts/Send-VMDecommissionEmail.ps1") {
+            ./scripts/Send-VMDecommissionEmail.ps1
+          }
+          else {
+            Write-Warning "Email script not found. Skipping email notification."
+          }
 
       - name: Upload Request Summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vm-decommission-request-summary
-          path: decommission-request-summary.json
-          if-no-files-found: ignore
-          retention-days: 30
+          name: vm-stop-request-summary
+          path: |
+            vm-stop-request-summary.json
+            vm-stop-request-summary.txt
+          if-no-files-found: warn
