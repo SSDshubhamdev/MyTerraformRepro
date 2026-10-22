@@ -43,14 +43,14 @@ permissions:
 
 jobs:
   submit-and-stop:
-    name: Submit Request and Deallocate VM
+    name: Submit Request, Stop VM and Notify
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Keep existing Azure OIDC authentication.
+      # Existing OIDC authentication preserved.
       - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
@@ -67,7 +67,7 @@ jobs:
 
           az account set --subscription "$env:SUBSCRIPTION_ID"
           if ($LASTEXITCODE -ne 0) {
-            throw "Unable to select the requested Azure subscription."
+            throw "Unable to select Azure subscription."
           }
 
           $accountJson = az account show --output json
@@ -78,10 +78,10 @@ jobs:
           $account = $accountJson | ConvertFrom-Json
 
           if ($account.id -ne $env:SUBSCRIPTION_ID) {
-            throw "Active subscription does not match the requested subscription."
+            throw "Active subscription does not match requested subscription."
           }
 
-          Write-Host "Azure OIDC login and subscription verification successful."
+          Write-Host "Azure OIDC authentication verified."
 
       - name: Ensure Storage Table Exists
         shell: pwsh
@@ -104,7 +104,7 @@ jobs:
 
           Write-Host "Azure Storage Table is ready."
 
-      - name: Save Request and Deallocate VM
+      - name: Save Request, Deallocate and Verify VM
         id: submit_request
         shell: pwsh
         env:
@@ -117,11 +117,12 @@ jobs:
           STORAGE_ACCOUNT: shubhamstorage11
           TABLE_NAME: VMDecommissionRequests
         run: |
-          $ErrorActionPreference = "Stop"
           ./scripts/Submit-VMDecommissionRequest.ps1
 
+      # This step cannot run unless the preceding step succeeds
+      # and explicitly confirms vm_stopped=true.
       - name: Send Email Notification
-        if: always() && steps.submit_request.outputs.request_id != ''
+        if: ${{ success() && steps.submit_request.outputs.vm_stopped == 'true' }}
         continue-on-error: true
         shell: pwsh
         env:
@@ -133,11 +134,12 @@ jobs:
           VM_NAME: ${{ inputs.vm_name }}
           VM_ENVIRONMENT: ${{ inputs.environment }}
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+          STORAGE_ACCOUNT: shubhamstorage11
+          TABLE_NAME: VMDecommissionRequests
           REQUEST_ID: ${{ steps.submit_request.outputs.request_id }}
-          JOB_STATUS: ${{ job.status }}
+          JOB_STATUS: VM deallocated successfully
         run: |
           $ErrorActionPreference = "Stop"
-
           ./scripts/Send-VMDecommissionEmail.ps1
 
       - name: Upload Request Summary
