@@ -25,15 +25,17 @@ on:
         type: choice
         options:
           - Dev
+          - Test
+          - UAT
           - Prod
 
       requester:
-        description: "Requester Name"
+        description: "Requester's Name"
         required: true
         type: string
 
       requester_email:
-        description: "Requester Email Address"
+        description: "Requester's Email Address"
         required: true
         type: string
 
@@ -42,15 +44,39 @@ permissions:
   contents: read
 
 jobs:
-  submit-and-stop:
-    name: Submit Request, Stop VM and Notify
+  submit-decommission-request:
+    name: Submit VM Decommission Request
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Existing OIDC authentication preserved.
+      - name: Verify Required Secrets
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+        run: |
+          $required = @(
+            "AZURE_CLIENT_ID",
+            "AZURE_TENANT_ID",
+            "SMTP_USERNAME",
+            "SMTP_APP_PASSWORD"
+          )
+
+          foreach ($name in $required) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+
+            if ([string]::IsNullOrWhiteSpace($value)) {
+              throw "Required GitHub secret is missing: $name"
+            }
+          }
+
+          Write-Host "Required secrets are configured."
+
       - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
@@ -58,54 +84,19 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ inputs.subscription_id }}
 
-      - name: Verify Azure Subscription
+      - name: Verify Azure CLI
         shell: pwsh
-        env:
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          az account set --subscription "$env:SUBSCRIPTION_ID"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to select Azure subscription."
-          }
-
-          $accountJson = az account show --output json
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to verify Azure subscription."
-          }
-
-          $account = $accountJson | ConvertFrom-Json
-
-          if ($account.id -ne $env:SUBSCRIPTION_ID) {
-            throw "Active subscription does not match requested subscription."
-          }
-
-          Write-Host "Azure OIDC authentication verified."
-
-      - name: Ensure Storage Table Exists
-        shell: pwsh
-        env:
-          STORAGE_ACCOUNT: shubhamstorage11
-          TABLE_NAME: VMDecommissionRequests
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          az storage table create `
-            --account-name "$env:STORAGE_ACCOUNT" `
-            --name "$env:TABLE_NAME" `
-            --auth-mode login `
-            --only-show-errors `
-            --output none
+          az account show --output table
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Unable to create or access the Azure Storage Table."
+            throw "Azure CLI authentication verification failed."
           }
 
-          Write-Host "Azure Storage Table is ready."
-
-      - name: Save Request, Deallocate and Verify VM
-        id: submit_request
+      - name: Validate VM and Save Request
+        id: submit
         shell: pwsh
         env:
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
@@ -119,33 +110,24 @@ jobs:
         run: |
           ./scripts/Submit-VMDecommissionRequest.ps1
 
-      # This step cannot run unless the preceding step succeeds
-      # and explicitly confirms vm_stopped=true.
-      - name: Send Email Notification
-        if: ${{ success() && steps.submit_request.outputs.vm_stopped == 'true' }}
-        continue-on-error: true
+      - name: Send Request Confirmation Email
+        if: success()
         shell: pwsh
         env:
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
-          REQUESTER: ${{ inputs.requester }}
-          REQUESTER_EMAIL: ${{ inputs.requester_email }}
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
           RESOURCE_GROUP: ${{ inputs.resource_group }}
           VM_NAME: ${{ inputs.vm_name }}
           VM_ENVIRONMENT: ${{ inputs.environment }}
-          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
-          STORAGE_ACCOUNT: shubhamstorage11
-          TABLE_NAME: VMDecommissionRequests
-          REQUEST_ID: ${{ steps.submit_request.outputs.request_id }}
-          JOB_STATUS: VM deallocated successfully
+          REQUESTER: ${{ inputs.requester }}
+          REQUESTER_EMAIL: ${{ inputs.requester_email }}
+          REQUEST_ID: ${{ steps.submit.outputs.request_id }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
           ./scripts/Send-VMDecommissionEmail.ps1
 
-      - name: Upload Request Summary
+      - name: Logout from Azure
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vm-decommission-request-summary
-          path: decommission-request-summary.json
-          if-no-files-found: warn
+        shell: pwsh
+        run: |
+          az logout
