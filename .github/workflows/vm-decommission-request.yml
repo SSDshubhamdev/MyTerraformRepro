@@ -42,14 +42,15 @@ permissions:
   contents: read
 
 jobs:
-  submit-request:
-    name: Submit VM Decommission Request
+  submit-and-stop:
+    name: Submit Request and Deallocate VM
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Keep existing Azure OIDC authentication.
       - name: Azure Login using OIDC
         uses: azure/login@v2
         with:
@@ -64,22 +65,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $accountJson = az account show --output json 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            throw "Azure login failed: $($accountJson -join "`n")"
-          }
-
           az account set --subscription "$env:SUBSCRIPTION_ID"
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not select subscription $env:SUBSCRIPTION_ID"
+            throw "Unable to select the requested Azure subscription."
           }
 
-          $account = az account show --output json | ConvertFrom-Json
+          $accountJson = az account show --output json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify Azure subscription."
+          }
+
+          $account = $accountJson | ConvertFrom-Json
+
           if ($account.id -ne $env:SUBSCRIPTION_ID) {
-            throw "Active Azure subscription does not match the requested subscription."
+            throw "Active subscription does not match the requested subscription."
           }
 
-          Write-Host "Azure subscription verified."
+          Write-Host "Azure OIDC login and subscription verification successful."
 
       - name: Ensure Storage Table Exists
         shell: pwsh
@@ -97,12 +99,12 @@ jobs:
             --output none
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not create or access Azure Storage Table."
+            throw "Unable to create or access the Azure Storage Table."
           }
 
-          Write-Host "Storage table is ready."
+          Write-Host "Azure Storage Table is ready."
 
-      - name: Submit Decommission Request
+      - name: Save Request and Deallocate VM
         id: submit_request
         shell: pwsh
         env:
@@ -119,7 +121,7 @@ jobs:
           ./scripts/Submit-VMDecommissionRequest.ps1
 
       - name: Send Email Notification
-        if: success()
+        if: always() && steps.submit_request.outputs.request_id != ''
         continue-on-error: true
         shell: pwsh
         env:
@@ -135,12 +137,13 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: |
           $ErrorActionPreference = "Stop"
+
           ./scripts/Send-VMDecommissionEmail.ps1
 
       - name: Upload Request Summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: decommission-request-summary
+          name: vm-decommission-request-summary
           path: decommission-request-summary.json
           if-no-files-found: warn
