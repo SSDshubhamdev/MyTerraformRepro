@@ -35,7 +35,7 @@ on:
         type: string
 
       requester_email:
-        description: "Requester's Email Address"
+        description: "Customer / Requester Email Address"
         required: true
         type: string
 
@@ -45,14 +45,14 @@ permissions:
 
 jobs:
   submit-decommission-request:
-    name: Submit VM Decommission Request
+    name: Deallocate VM and Notify Customer
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Verify Required Secrets
+      - name: Verify Required GitHub Secrets
         shell: pwsh
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -60,6 +60,8 @@ jobs:
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           $required = @(
             "AZURE_CLIENT_ID",
             "AZURE_TENANT_ID",
@@ -71,7 +73,7 @@ jobs:
             $value = [Environment]::GetEnvironmentVariable($name)
 
             if ([string]::IsNullOrWhiteSpace($value)) {
-              throw "Required GitHub secret is missing: $name"
+              throw "Missing GitHub secret: $name"
             }
           }
 
@@ -84,18 +86,24 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ inputs.subscription_id }}
 
-      - name: Verify Azure CLI
+      - name: Verify Azure Login
         shell: pwsh
+        env:
+          SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          az account show --output table
+          $result = & az account show `
+            --subscription $env:SUBSCRIPTION_ID `
+            --output table 2>&1
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Azure CLI authentication verification failed."
+            throw "Azure login verification failed: $($result -join "`n")"
           }
 
-      - name: Validate VM and Save Request
+          $result | Write-Host
+
+      - name: Validate VM, Save Request, Deallocate and Wait
         id: submit
         shell: pwsh
         env:
@@ -110,8 +118,8 @@ jobs:
         run: |
           ./scripts/Submit-VMDecommissionRequest.ps1
 
-      - name: Send Request Confirmation Email
-        if: success()
+      - name: Send Customer Email After Confirmed Deallocation
+        if: success() && steps.submit.outputs.vm_stopped == 'true'
         shell: pwsh
         env:
           SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
@@ -121,6 +129,7 @@ jobs:
           REQUESTER: ${{ inputs.requester }}
           REQUESTER_EMAIL: ${{ inputs.requester_email }}
           REQUEST_ID: ${{ steps.submit.outputs.request_id }}
+          VM_POWER_STATE: ${{ steps.submit.outputs.vm_power_state }}
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
         run: |
@@ -130,4 +139,5 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          az logout
+          az logout 2>$null
+          exit 0
